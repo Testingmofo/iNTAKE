@@ -8,7 +8,7 @@ iNTAKE provides a clean and straightforward interface for downloading media with
 
 ## ✨ Features
 
-- 🎵 MP3 audio downloads
+- 🎵 MP3 & Opus audio downloads w/ Thumbnail embedded
 - 🎬 MP4 video downloads
 - 📋 Queue-based downloading
 - 🌙 Dark-mode interface
