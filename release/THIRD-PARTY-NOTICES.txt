@@ -1,0 +1,29 @@
+iNTAKE Third-Party Components
+============================
+
+This distribution bundles third-party runtime components. Review the upstream
+projects and their license files before public redistribution.
+
+OpenJDK / Eclipse Temurin
+  https://adoptium.net/
+  GPLv2 with Classpath Exception
+
+OpenJFX
+  https://openjfx.io/
+  GPLv2 with Classpath Exception
+
+yt-dlp
+  https://github.com/yt-dlp/yt-dlp
+  The Unlicense
+
+FFmpeg
+  https://ffmpeg.org/
+  LGPLv2.1+ or GPLv2+, depending on the configuration of the bundled build.
+  The distributor is responsible for satisfying the exact build's license.
+
+Deno
+  https://github.com/denoland/deno
+  MIT License
+
+WiX Toolset is used to create the installer but is not bundled in the installed
+application: https://wixtoolset.org/

@@ -1,130 +1,56 @@
 # iNTAKE
 
-> A lightweight, dark-mode GUI wrapper for **yt-dlp** built for speed, simplicity, and a classic download-manager experience.
+iNTAKE is a Windows media-download manager built with JavaFX and yt-dlp. It provides a Cyberpunk-inspired desktop interface, background downloads through the system tray, download history, configurable audio and video formats, playlist controls, and a companion browser extension.
 
-iNTAKE provides a clean and straightforward interface for downloading media without unnecessary clutter. Paste a link, choose a format, queue your downloads, and let the app do the work.
+This repository contains the current JavaFX edition. The original PowerShell edition remains available from the repository's earlier history and is referred to as **iNTAKE-Powershell**.
 
----
+## Features
 
-## ✨ Features
+- Queue-based, asynchronous yt-dlp downloads
+- Audio and video format selection
+- Separate audio and video output locations
+- Playlist ignore and selection controls
+- Download progress, history, logs, and error reports
+- System-tray operation and silent browser-extension startup
+- Chrome and Edge browser extension with native messaging
+- Self-contained Windows installer and portable package generation
 
-- 🎵 MP3 & Opus audio downloads w/ Thumbnail embedded
-- 🎬 MP4 video downloads
-- 📋 Queue-based downloading
-- 🌙 Dark-mode interface
-- ⚡ Lightweight PowerShell implementation
-- 🔄 Automatic yt-dlp engine updates on launch
+## Running from source
 
----
-
-## 📦 Requirements
-
-Before running iNTAKE, install the following dependencies.
-
-### 1. FFmpeg
-
-Required for audio extraction, video/audio merging, and format conversion.
+Development requires Windows, JDK 17 or newer, Maven, yt-dlp, FFmpeg/FFprobe, and Deno available on `PATH`.
 
 ```powershell
-winget install ffmpeg
+mvn clean javafx:run
 ```
 
-### 2. yt-dlp
+Alternatively, run `Launch iNTAKE.cmd`. The launcher checks the required tools and can use Chocolatey to install or update missing dependencies.
 
-The download engine used by iNTAKE.
+See [LAUNCHING.md](LAUNCHING.md) for launcher details.
+
+## Building a Windows release
+
+The release builder requires Chocolatey, WiX Toolset 3.x, JDK tooling, Maven, yt-dlp, FFmpeg, and Deno.
 
 ```powershell
-winget install yt-dlp
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts\Build-Release.ps1
 ```
 
-> **Important**
->
-> After installing FFmpeg and yt-dlp, sign out of Windows and sign back in (or restart your PC). This ensures their paths are properly registered in your system environment variables so iNTAKE can detect and use them.
+Generated installers and archives are placed in `For-Release`. That directory is intentionally excluded from Git because release binaries should be uploaded as GitHub Release assets.
 
----
+## Browser extension
 
-## 🚀 Installation
+The unpacked extension is located in `browser-extension`. Release builds also produce a ZIP archive that can be attached to a GitHub Release.
 
-### Option A — Compiled Version
+The extension communicates with the local iNTAKE application. If iNTAKE is offline, its native-messaging helper starts the application silently before forwarding the download request.
 
-Run:
+## Project layout
 
-```text
-iNTAKE.exe
-```
+- `src/main/java` — JavaFX application source
+- `browser-extension` — Chrome/Edge extension
+- `native-host` — native-messaging helper source
+- `scripts` — launcher and release-build scripts
+- `release` — release documentation templates
 
-### Option B — PowerShell Script
+## Legal
 
-Right-click:
-
-```text
-iNTAKE.ps1
-```
-
-and select **Run with PowerShell**.
-
----
-
-## 📥 Usage
-
-1. Launch iNTAKE.
-2. Allow the application to check for engine updates.
-3. Paste a YouTube URL.
-4. Select your preferred output format.
-5. Click **Start Queue**.
-6. Enjoy your downloads.
-
----
-
-# 🌐 iNTAKE Browser Extension
-
-Quick Queueing from YouTube
-
-Adds download buttons directly on YouTube pages.
-
-- Installation
-
-1. Open your browser's Extensions page.
-
-2. Enable Developer Mode.
-
-3. Click Load Unpacked.
-
-4. Select the provided extension folder.
-
-5. Open YouTube and enjoy.
-
-
-- What it does
-  
-1. Adds download buttons near the Subscribe button.
-2. Sends videos directly to your iNTAKE workflow.
-3. Provides faster access without manually copying links.
-
-
----
-## 📁 Download Location
-
-Currently, all downloads are saved to your default **Downloads** folder.
-
-Future updates will include customizable output directories and additional quality-of-life features.
-
----
-
-## 🛠 Built With
-
-- PowerShell
-- yt-dlp
-- FFmpeg
-
----
-
-## 💬 Note from the Developer
-
-> For now, downloads go straight to the default Downloads folder.
->
-> I'll keep vibecoding and adding features as time goes on.
-
----
-
-Built with ❤️ for people who prefer simple tools.
+iNTAKE is provided under the license in [LICENSE](LICENSE). Downloads must comply with the applicable website terms, copyright law, and local law. Third-party components retain their respective licenses; see `release/THIRD-PARTY-NOTICES.txt`.

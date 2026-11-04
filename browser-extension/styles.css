@@ -1,0 +1,205 @@
+:root {
+  --intake-bg: #0b0e14;
+  --intake-panel: #111722;
+  --intake-yellow: #fcee0a;
+  --intake-cyan: #00f0ff;
+  --intake-magenta: #ff0055;
+}
+
+.intake-watch-controls {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 7px !important;
+  margin-left: 10px !important;
+  position: relative !important;
+  z-index: 2147483646 !important;
+}
+
+.intake-r34-controls {
+  display: flex !important;
+  margin: 10px 0 !important;
+  width: max-content !important;
+}
+
+.intake-glitch-button,
+.intake-glitch-icon {
+  appearance: none !important;
+  box-sizing: border-box !important;
+  border: 1px solid var(--intake-cyan) !important;
+  border-radius: 0 !important;
+  background: var(--intake-bg) !important;
+  color: var(--intake-yellow) !important;
+  font-family: Consolas, "Courier New", monospace !important;
+  font-weight: 900 !important;
+  cursor: pointer !important;
+  overflow: hidden !important;
+  isolation: isolate !important;
+  text-transform: uppercase !important;
+  box-shadow: 3px 3px 0 var(--intake-yellow) !important;
+}
+
+.intake-glitch-button {
+  position: relative !important;
+  min-width: 78px !important;
+  height: 34px !important;
+  padding: 0 13px !important;
+  letter-spacing: 1px !important;
+  font-size: 12px !important;
+  clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 10px) !important;
+}
+
+.intake-glitch-button::before,
+.intake-glitch-button::after,
+.intake-glitch-icon::before,
+.intake-glitch-icon::after {
+  content: attr(data-label) !important;
+  position: absolute !important;
+  inset: 0 !important;
+  display: grid !important;
+  place-items: center !important;
+  pointer-events: none !important;
+  opacity: 0 !important;
+}
+
+.intake-glitch-button:hover,
+.intake-glitch-icon:hover {
+  background: var(--intake-magenta) !important;
+  color: #fff !important;
+  border-color: var(--intake-yellow) !important;
+  animation: intake-jitter 170ms steps(2, end) infinite !important;
+}
+
+.intake-glitch-button:hover::before,
+.intake-glitch-icon:hover::before {
+  color: var(--intake-cyan) !important;
+  opacity: .8 !important;
+  transform: translate(-2px, -1px) !important;
+  clip-path: inset(0 0 52% 0) !important;
+}
+
+.intake-glitch-button:hover::after,
+.intake-glitch-icon:hover::after {
+  color: var(--intake-yellow) !important;
+  opacity: .8 !important;
+  transform: translate(2px, 1px) !important;
+  clip-path: inset(52% 0 0 0) !important;
+}
+
+.intake-thumbnail-host {
+  position: relative !important;
+}
+
+.intake-glitch-icon {
+  position: absolute !important;
+  top: 5px !important;
+  right: 5px !important;
+  z-index: 2147483647 !important;
+  width: 30px !important;
+  height: 28px !important;
+  padding: 0 !important;
+  font-size: 0 !important;
+  box-shadow: 2px 2px 0 var(--intake-yellow) !important;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px) !important;
+}
+
+.intake-glitch-icon::before {
+  content: "⇩" !important;
+  opacity: 1 !important;
+  color: var(--intake-yellow) !important;
+  font-size: 18px !important;
+  transform: none !important;
+  clip-path: none !important;
+}
+
+.intake-glitch-icon:hover::before {
+  color: #fff !important;
+  transform: translate(-1px, 0) !important;
+}
+
+.intake-processing { animation: intake-pulse 400ms steps(2, end) infinite !important; }
+.intake-success { background: var(--intake-cyan) !important; color: var(--intake-bg) !important; }
+.intake-error { background: var(--intake-magenta) !important; color: #fff !important; }
+
+.intake-download-notice {
+  all: initial !important;
+  position: fixed !important;
+  top: 18px !important;
+  right: 18px !important;
+  z-index: 2147483647 !important;
+  box-sizing: border-box !important;
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 6px !important;
+  width: min(390px, calc(100vw - 36px)) !important;
+  padding: 14px 18px 15px !important;
+  border: 1px solid var(--intake-cyan) !important;
+  background: rgba(11, 14, 20, .97) !important;
+  color: #d7f9ff !important;
+  box-shadow: 5px 5px 0 var(--intake-yellow), 0 0 18px rgba(0, 240, 255, .3) !important;
+  clip-path: polygon(16px 0, 100% 0, 100% calc(100% - 14px), calc(100% - 14px) 100%, 0 100%, 0 16px) !important;
+  font-family: Consolas, "Courier New", monospace !important;
+  opacity: 0 !important;
+  transform: translateX(calc(100% + 30px)) !important;
+  pointer-events: none !important;
+  transition: opacity 160ms linear, transform 220ms steps(4, end) !important;
+}
+
+.intake-download-notice.intake-notice-visible {
+  opacity: 1 !important;
+  transform: translateX(0) !important;
+  animation: intake-notice-glitch 2.4s steps(1, end) infinite !important;
+}
+
+.intake-notice-title,
+.intake-notice-message {
+  all: initial !important;
+  display: block !important;
+  font-family: Consolas, "Courier New", monospace !important;
+}
+
+.intake-notice-title {
+  color: var(--intake-yellow) !important;
+  font-size: 13px !important;
+  font-weight: 900 !important;
+  letter-spacing: .5px !important;
+  text-transform: uppercase !important;
+}
+
+.intake-notice-message {
+  color: #d7f9ff !important;
+  font-size: 11px !important;
+  line-height: 1.45 !important;
+}
+
+.intake-notice-success { border-color: var(--intake-cyan) !important; }
+.intake-notice-success .intake-notice-title { color: var(--intake-cyan) !important; }
+.intake-notice-error {
+  border-color: var(--intake-magenta) !important;
+  box-shadow: 5px 5px 0 var(--intake-magenta), 0 0 18px rgba(255, 0, 85, .35) !important;
+}
+.intake-notice-error .intake-notice-title { color: var(--intake-magenta) !important; }
+
+@keyframes intake-jitter {
+  0% { transform: translate(0, 0); }
+  35% { transform: translate(1px, -1px); }
+  70% { transform: translate(-1px, 1px); }
+  100% { transform: translate(0, 0); }
+}
+
+@keyframes intake-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.8); }
+}
+
+@keyframes intake-notice-glitch {
+  0%, 92%, 100% { filter: none; }
+  93% { filter: hue-rotate(35deg); transform: translateX(-2px); }
+  95% { filter: none; transform: translateX(2px); }
+  97% { transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .intake-glitch-button,
+  .intake-glitch-icon,
+  .intake-download-notice { animation: none !important; }
+}
