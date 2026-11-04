@@ -1,0 +1,30 @@
+# Maven and Java build output
+target/
+*.class
+
+# Local release builds and verification output
+For-Release/
+.release-build/
+verify-lib/
+verify-classes/
+
+# IDE and editor metadata
+.idea/
+.vscode/
+*.iml
+
+# Operating-system files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Runtime data and diagnostics
+failedError.txt
+intake-config.properties
+download-history.json
+*.log
+
+# Generated native-host binary and local registration manifest
+native-host/iNTAKE.NativeHost.exe
+native-host/com.insrt.intake.json
+

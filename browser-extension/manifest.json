@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "iNTAKE // Media NetCrawler",
+  "version": "1.3.0",
+  "description": "Queues media from supported browser pages into the local iNTAKE application.",
+  "permissions": ["nativeMessaging"],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwC++QdoE6IO8H9qr7srgQHWzvzmPjZPRfatqRFgs7+lcDguuImKhTKkmwyResEti7CptudPPkLrXYg975AuxppnymKRHEnHSksROIoyFi/zuWJII5Je2R18eRMPPrwAv+v6g68WZS87n1ileuVGDihRrxjca5viNyVncE6llffTMUaeOm7H5TApj5juWAnD/vnv4n0F0shce2BRa5wn/RKpOMEqTz8inIyqix4nLKjwGBKhvsqoS8a9HkvxabEXCIyLdrBiNdkEnRkcS8M3y/cB0lxANMLh6J7yIHioiaLpWXrq/JEC7BxTRemB0pMPfJe5pnqK+C1FwjTk2BSKwzQIDAQAB",
+  "host_permissions": [
+    "http://127.0.0.1:17845/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*"
+      ],
+      "js": ["notifications.js", "youtube.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://rule34.xxx/*",
+        "https://*.rule34.xxx/*"
+      ],
+      "js": ["notifications.js", "rule34.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "exclude_matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*",
+        "https://rule34.xxx/*",
+        "https://*.rule34.xxx/*"
+      ],
+      "js": ["notifications.js", "generic.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
