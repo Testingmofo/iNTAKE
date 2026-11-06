@@ -13,9 +13,12 @@ import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.scene.Node;
+import javafx.scene.Parent;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.CheckBox;
+import javafx.scene.control.ColorPicker;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.CustomMenuItem;
 import javafx.scene.control.Label;
@@ -39,6 +42,7 @@ import javafx.scene.paint.Color;
 import javafx.scene.shape.Polygon;
 import javafx.scene.shape.Polyline;
 import javafx.scene.shape.Rectangle;
+import javafx.scene.shape.Shape;
 import javafx.scene.shape.StrokeLineJoin;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
@@ -87,8 +91,8 @@ import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -118,12 +122,20 @@ import java.util.regex.Pattern;
 public final class Main extends Application {
     private static final String BACKGROUND = "#0b0e14";
     private static final String PANEL = "#111722";
-    private static final String YELLOW = "#fcee0a";
-    private static final String CYAN = "#00f0ff";
-    private static final String MAGENTA = "#ff0055";
+    private static final String DEFAULT_MAIN_COLOR = "#fcee0a";
+    private static final String DEFAULT_ACCENT_COLOR = "#00f0ff";
+    private static final String DEFAULT_HIGHLIGHT_COLOR = "#ff0055";
+    // These role-based palette values intentionally retain their original internal
+    // names to keep the existing style construction compact. They are mutable only
+    // through applyTheme and represent Main, Accent, and Highlight respectively.
+    private static volatile String YELLOW = DEFAULT_MAIN_COLOR;
+    private static volatile String CYAN = DEFAULT_ACCENT_COLOR;
+    private static volatile String MAGENTA = DEFAULT_HIGHLIGHT_COLOR;
     private static final String TEXT = "#d7f9ff";
     private static final int MAX_LOG_NODES = 5_000;
     private static final int MAX_HISTORY_ENTRIES = 2_000;
+    private static final int DOWNLOAD_CONCURRENCY = 2;
+    private static final int LOG_FLUSH_BATCH_SIZE = 250;
     private static final int EXTENSION_BRIDGE_PORT = 17_845;
     private static final int MAX_EXTENSION_REQUEST_BYTES = 16_384;
     private static final String EXTENSION_ID = "omgodbpfilkfdihjffinlknijmdpogbn";
@@ -135,6 +147,12 @@ public final class Main extends Application {
             "avi", "flv", "mkv", "mov", "mp4", "webm");
     private static final List<String> DEFAULT_AUDIO_FORMATS = List.of("opus", "mp3");
     private static final List<String> DEFAULT_VIDEO_FORMATS = List.of("mp4", "mov");
+    private static final List<ThemePreset> CYBERPUNK_THEME_PRESETS = List.of(
+            new ThemePreset("NEON DISTRICT", new ThemePalette("#fcee0a", "#00f0ff", "#ff0055")),
+            new ThemePreset("NETRUNNER ICE", new ThemePalette("#00f0ff", "#7a5cff", "#ff2bd6")),
+            new ThemePreset("ARASAKA ALERT", new ThemePalette("#ff1744", "#f5f7fa", "#00e5ff")),
+            new ThemePreset("TOXIC CHROME", new ThemePalette("#7cff00", "#00ffd5", "#ff6b00")),
+            new ThemePreset("SYNTHWAVE GRID", new ThemePalette("#ff2bd6", "#7c4dff", "#00f0ff")));
 
     private static final Pattern PROGRESS_PATTERN = Pattern.compile(
             "^\\[download]\\s+(?<percent>\\d+(?:\\.\\d+)?)%\\s+of\\s+(?:~\\s*)?(?<size>\\S+).*$");
@@ -164,14 +182,20 @@ public final class Main extends Application {
     private final Condition unpaused = pauseLock.newCondition();
     private final Object failureFileLock = new Object();
     private final Object historyFileLock = new Object();
+    private final Object settingsFileLock = new Object();
+    private final ConcurrentLinkedQueue<LogMessage> pendingLogs = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean logFlushScheduled = new AtomicBoolean(false);
+    private final java.util.Set<Process> activeProcesses = ConcurrentHashMap.newKeySet();
+    private final java.util.Set<DownloadItem> activeItems = ConcurrentHashMap.newKeySet();
 
-    private final ExecutorService coordinator = Executors.newSingleThreadExecutor(
+    private final ExecutorService coordinator = Executors.newFixedThreadPool(DOWNLOAD_CONCURRENCY,
             daemonThreadFactory("intake-coordinator"));
     private final ExecutorService background = Executors.newCachedThreadPool(
             daemonThreadFactory("intake-background"));
+    private final ExecutorService mvssWorker = Executors.newSingleThreadExecutor(
+            daemonThreadFactory("intake-mvss"));
+    private final MusicVibeSorter musicVibeSorter = new MusicVibeSorter(resolveFfmpegExecutable());
 
-    private volatile Process activeProcess;
-    private volatile DownloadItem activeItem;
     private volatile boolean silentLaunch;
     private volatile boolean extensionLaunch;
     private volatile TrayIcon trayIcon;
@@ -184,12 +208,13 @@ public final class Main extends Application {
     private TextFlow logFlow;
     private ScrollPane logScrollPane;
     private Button pauseButton;
+    private ToggleButton mvssToggle;
     private Label stateLabel;
     private ComboBox<String> audioFormatSelector;
     private ComboBox<String> videoFormatSelector;
     private final Path settingsFile = APPLICATION_DATA_DIRECTORY.resolve("intake.properties");
     private final Path historyFile = APPLICATION_DATA_DIRECTORY.resolve("download-history.tsv");
-    private AppSettings appSettings = AppSettings.defaults();
+    private volatile AppSettings appSettings = AppSettings.defaults();
     private double windowDragOffsetX;
     private double windowDragOffsetY;
     private boolean windowDragArmed;
@@ -202,6 +227,7 @@ public final class Main extends Application {
     public void init() {
         INSTANCE.set(this);
         appSettings = loadSettings();
+        setActiveThemeColors(appSettings.theme());
         List<String> args = getParameters().getRaw();
         silentLaunch = containsIgnoreCase(args, "-silent") || containsIgnoreCase(args, "-extension");
         extensionLaunch = containsIgnoreCase(args, "-extension");
@@ -220,7 +246,9 @@ public final class Main extends Application {
         boolean trayReady = installSystemTray();
         startExtensionBridge();
 
-        coordinator.execute(this::coordinateCommands);
+        for (int worker = 0; worker < DOWNLOAD_CONCURRENCY; worker++) {
+            coordinator.execute(this::coordinateCommands);
+        }
         background.execute(this::runUpdateCheck);
 
         List<String> ytDlpArguments = getParameters().getRaw().stream()
@@ -248,11 +276,12 @@ public final class Main extends Application {
             marqueeAnimation = null;
         }
         resumeWorkers();
-        Process process = activeProcess;
-        if (process != null && process.isAlive()) {
-            process.destroy();
+        for (Process process : activeProcesses) {
             if (process.isAlive()) {
-                process.destroyForcibly();
+                process.destroy();
+                if (process.isAlive()) {
+                    process.destroyForcibly();
+                }
             }
         }
         HttpServer bridge = extensionBridge;
@@ -262,6 +291,7 @@ public final class Main extends Application {
         }
         coordinator.shutdownNow();
         background.shutdownNow();
+        mvssWorker.shutdownNow();
         removeTrayIcon();
         INSTANCE.compareAndSet(this, null);
     }
@@ -587,11 +617,13 @@ public final class Main extends Application {
 
         TextField audioPath = createSettingsPathField(appSettings.audioOutputDirectory());
         TextField videoPath = createSettingsPathField(appSettings.videoOutputDirectory());
+        ThemeEditor themeEditor = createThemeEditor(appSettings.theme());
 
         VBox editor = new VBox(12,
                 settingsSectionLabel("FORMAT ROUTING", CYAN),
                 filetypeMenu,
                 favoritesRow,
+                themeEditor.root(),
                 settingsSectionLabel("AUDIO DOWNLOAD LOCATION", YELLOW),
                 createDirectoryEditor(audioPath, "Choose audio download directory"),
                 settingsSectionLabel("VIDEO DOWNLOAD LOCATION", YELLOW),
@@ -609,7 +641,8 @@ public final class Main extends Application {
         Button save = new Button("SAVE CONFIG");
         save.setStyle(primaryButtonStyle());
         save.setOnAction(event -> saveSettingsFromEditor(
-                audioChecks, videoChecks, favoriteAudio, favoriteVideo, audioPath, videoPath));
+                audioChecks, videoChecks, favoriteAudio, favoriteVideo, audioPath, videoPath,
+                themeEditor.mainColor(), themeEditor.accentColor(), themeEditor.highlightColor()));
         Region footerSpacer = new Region();
         HBox.setHgrow(footerSpacer, Priority.ALWAYS);
         HBox footer = new HBox(10, configLocation, footerSpacer, cancel, save);
@@ -618,7 +651,12 @@ public final class Main extends Application {
         footer.setStyle("-fx-background-color: #080a0f; -fx-border-color: " + CYAN
                 + " transparent transparent transparent; -fx-border-width: 1 0 0 0;");
 
-        BorderPane settingsRoot = new BorderPane(editor);
+        ScrollPane editorScroll = new ScrollPane(editor);
+        editorScroll.setFitToWidth(true);
+        editorScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        editorScroll.setStyle("-fx-background: " + PANEL + "; -fx-background-color: " + PANEL
+                + "; -fx-border-color: transparent;");
+        BorderPane settingsRoot = new BorderPane(editorScroll);
         settingsRoot.setTop(createSettingsTitleBar());
         settingsRoot.setBottom(footer);
         settingsRoot.setStyle("-fx-background-color: " + BACKGROUND + "; -fx-border-color: "
@@ -628,9 +666,9 @@ public final class Main extends Application {
         settingsStage.initOwner(primaryStage);
         settingsStage.initModality(Modality.WINDOW_MODAL);
         settingsStage.setTitle("iNTAKE // Configuration");
-        settingsStage.setScene(new Scene(settingsRoot, 720, 520, Color.TRANSPARENT));
+        settingsStage.setScene(new Scene(settingsRoot, 760, 680, Color.TRANSPARENT));
         settingsStage.setMinWidth(620);
-        settingsStage.setMinHeight(470);
+        settingsStage.setMinHeight(560);
         settingsStage.setOnCloseRequest(event -> {
             event.consume();
             settingsStage.hide();
@@ -703,6 +741,125 @@ public final class Main extends Application {
         }
     }
 
+    private ThemeEditor createThemeEditor(ThemePalette currentTheme) {
+        ComboBox<ThemePreset> presets = new ComboBox<>(
+                FXCollections.observableArrayList(CYBERPUNK_THEME_PRESETS));
+        presets.setPromptText("CUSTOM MATRIX");
+        presets.setPrefWidth(220);
+        presets.setStyle("-fx-background-color: #080a0f; -fx-border-color: " + CYAN
+                + "; -fx-border-width: 1; -fx-background-radius: 0; -fx-border-radius: 0;"
+                + " -fx-font-family: 'Monospaced';");
+        Button resetTheme = new Button("RESET NEON DISTRICT");
+        resetTheme.setStyle(primaryButtonStyle());
+        resetTheme.setOnAction(event -> presets.setValue(CYBERPUNK_THEME_PRESETS.get(0)));
+        HBox presetRow = new HBox(10, presets, resetTheme);
+        presetRow.setAlignment(Pos.CENTER_LEFT);
+
+        ColorPicker mainColor = createThemeColorPicker(currentTheme.mainColor());
+        ColorPicker accentColor = createThemeColorPicker(currentTheme.accentColor());
+        ColorPicker highlightColor = createThemeColorPicker(currentTheme.highlightColor());
+        mainColor.setTooltip(new Tooltip("Primary buttons, borders, success states, and major highlights."));
+        accentColor.setTooltip(new Tooltip("Secondary borders, telemetry, icons, and system states."));
+        highlightColor.setTooltip(new Tooltip("Warnings, errors, paused states, and hover alerts."));
+
+        Label mainPreview = createThemePreviewCell("MAIN");
+        Label accentPreview = createThemePreviewCell("ACCENT");
+        Label highlightPreview = createThemePreviewCell("HIGHLIGHT");
+        HBox preview = new HBox(0, mainPreview, accentPreview, highlightPreview);
+        preview.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(mainPreview, Priority.ALWAYS);
+        HBox.setHgrow(accentPreview, Priority.ALWAYS);
+        HBox.setHgrow(highlightPreview, Priority.ALWAYS);
+
+        Runnable refreshPreview = () -> {
+            styleThemePreviewCell(mainPreview, toHex(mainColor.getValue()));
+            styleThemePreviewCell(accentPreview, toHex(accentColor.getValue()));
+            styleThemePreviewCell(highlightPreview, toHex(highlightColor.getValue()));
+        };
+        AtomicBoolean applyingPreset = new AtomicBoolean(false);
+        presets.setOnAction(event -> {
+            ThemePreset selected = presets.getValue();
+            if (selected == null) {
+                return;
+            }
+            applyingPreset.set(true);
+            try {
+                mainColor.setValue(Color.web(selected.palette().mainColor()));
+                accentColor.setValue(Color.web(selected.palette().accentColor()));
+                highlightColor.setValue(Color.web(selected.palette().highlightColor()));
+                refreshPreview.run();
+            } finally {
+                applyingPreset.set(false);
+            }
+        });
+        for (ColorPicker picker : List.of(mainColor, accentColor, highlightColor)) {
+            picker.setOnAction(event -> {
+                if (!applyingPreset.get()) {
+                    presets.getSelectionModel().clearSelection();
+                }
+                refreshPreview.run();
+            });
+        }
+        CYBERPUNK_THEME_PRESETS.stream()
+                .filter(preset -> preset.palette().equals(currentTheme))
+                .findFirst()
+                .ifPresent(presets::setValue);
+        refreshPreview.run();
+
+        VBox mainBox = new VBox(5, settingsSectionLabel("MAIN", YELLOW), mainColor);
+        VBox accentBox = new VBox(5, settingsSectionLabel("ACCENT", CYAN), accentColor);
+        VBox highlightBox = new VBox(5, settingsSectionLabel("HIGHLIGHT", MAGENTA), highlightColor);
+        HBox colorRow = new HBox(14, mainBox, accentBox, highlightBox);
+        colorRow.setAlignment(Pos.CENTER_LEFT);
+
+        Label latencyNote = new Label(
+                "Palette changes apply instantly after SAVE CONFIG and persist between launches.");
+        latencyNote.setTextFill(Color.web("#8ca3b8"));
+        latencyNote.setFont(Font.font("Monospaced", 10));
+
+        Separator separator = new Separator();
+        separator.setStyle("-fx-background-color: " + CYAN + ";");
+        VBox section = new VBox(9,
+                separator,
+                settingsSectionLabel("CYBERPUNK COLOR MATRIX", CYAN),
+                presetRow,
+                colorRow,
+                preview,
+                latencyNote);
+        section.setPadding(new Insets(7, 0, 5, 0));
+        return new ThemeEditor(section, mainColor, accentColor, highlightColor);
+    }
+
+    private static ColorPicker createThemeColorPicker(String color) {
+        ColorPicker picker = new ColorPicker(Color.web(color));
+        picker.setPrefWidth(150);
+        picker.setStyle("-fx-background-color: #080a0f; -fx-border-color: " + CYAN
+                + "; -fx-border-width: 1; -fx-background-radius: 0; -fx-border-radius: 0;");
+        return picker;
+    }
+
+    private static Label createThemePreviewCell(String text) {
+        Label label = new Label(text);
+        label.getStyleClass().add("intake-theme-preview");
+        label.setAlignment(Pos.CENTER);
+        label.setMaxWidth(Double.MAX_VALUE);
+        label.setMinHeight(34);
+        label.setFont(Font.font("Monospaced", FontWeight.EXTRA_BOLD, 11));
+        return label;
+    }
+
+    private static void styleThemePreviewCell(Label label, String color) {
+        label.setStyle("-fx-background-color: " + color + "; -fx-text-fill: #080a0f;"
+                + " -fx-border-color: #0b0e14; -fx-border-width: 1;");
+    }
+
+    private static String toHex(Color color) {
+        return String.format(Locale.ROOT, "#%02x%02x%02x",
+                Math.round(color.getRed() * 255),
+                Math.round(color.getGreen() * 255),
+                Math.round(color.getBlue() * 255));
+    }
+
     private HBox createDirectoryEditor(TextField pathField, String dialogTitle) {
         Button browse = new Button("BROWSE");
         browse.setStyle(primaryButtonStyle());
@@ -739,7 +896,9 @@ public final class Main extends Application {
 
     private void saveSettingsFromEditor(List<CheckBox> audioChecks, List<CheckBox> videoChecks,
                                         ComboBox<String> favoriteAudio, ComboBox<String> favoriteVideo,
-                                        TextField audioPath, TextField videoPath) {
+                                        TextField audioPath, TextField videoPath,
+                                        ColorPicker mainColor, ColorPicker accentColor,
+                                        ColorPicker highlightColor) {
         List<String> selectedAudio = selectedFormats(audioChecks);
         List<String> selectedVideo = selectedFormats(videoChecks);
         if (selectedAudio.isEmpty() || selectedVideo.isEmpty()) {
@@ -753,16 +912,24 @@ public final class Main extends Application {
                     favoriteVideo.getValue(), selectedVideo, "video");
             Path audioDirectory = normalizeConfiguredDirectory(audioPath.getText(), "audio");
             Path videoDirectory = normalizeConfiguredDirectory(videoPath.getText(), "video");
+            ThemePalette selectedTheme = new ThemePalette(
+                    toHex(mainColor.getValue()), toHex(accentColor.getValue()),
+                    toHex(highlightColor.getValue()));
             Files.createDirectories(audioDirectory);
             Files.createDirectories(videoDirectory);
             AppSettings updated = new AppSettings(
                     selectedAudio, selectedVideo, selectedFavoriteAudio, selectedFavoriteVideo,
-                    audioDirectory, videoDirectory);
+                    audioDirectory, videoDirectory, appSettings.mvssEnabled(), selectedTheme);
             persistSettings(updated);
             appSettings = updated;
+            applyTheme(selectedTheme);
             applyFormatSettings();
             appendLog("Configuration saved to " + settingsFile, LogKind.SUCCESS);
-            settingsStage.hide();
+            Stage completedEditor = settingsStage;
+            if (completedEditor != null) {
+                completedEditor.hide();
+            }
+            settingsStage = null;
         } catch (IOException | RuntimeException failure) {
             appendLog("Unable to save configuration: " + failure.getMessage(), LogKind.ERROR);
         }
@@ -797,6 +964,106 @@ public final class Main extends Application {
     private void applyFormatSettings() {
         updateFormatSelector(audioFormatSelector, appSettings.audioFormats(), appSettings.favoriteAudioFormat());
         updateFormatSelector(videoFormatSelector, appSettings.videoFormats(), appSettings.favoriteVideoFormat());
+    }
+
+    private void applyTheme(ThemePalette theme) {
+        ThemePalette previous = new ThemePalette(YELLOW, CYAN, MAGENTA);
+        if (previous.equals(theme)) {
+            return;
+        }
+        setActiveThemeColors(theme);
+        rebuildPrimaryInterface(previous, theme);
+        TrayIcon icon = trayIcon;
+        if (icon != null) {
+            EventQueue.invokeLater(() -> icon.setImage(createTrayImage()));
+        }
+    }
+
+    private void rebuildPrimaryInterface(ThemePalette previous, ThemePalette updated) {
+        if (primaryStage == null || primaryStage.getScene() == null) {
+            return;
+        }
+        double width = primaryStage.getWidth();
+        double height = primaryStage.getHeight();
+        boolean maximized = primaryStage.isMaximized();
+        List<Node> preservedLogNodes = new ArrayList<>();
+        if (logFlow != null) {
+            preservedLogNodes.addAll(logFlow.getChildren());
+            preservedLogNodes.forEach(node -> recolorNodeTree(node, previous, updated));
+            logFlow.getChildren().clear();
+        }
+        if (marqueeAnimation != null) {
+            marqueeAnimation.stop();
+            marqueeAnimation = null;
+        }
+
+        initializeUI(primaryStage);
+        logFlow.getChildren().addAll(preservedLogNodes);
+        if (!maximized) {
+            primaryStage.setWidth(width);
+            primaryStage.setHeight(height);
+        }
+        primaryStage.setMaximized(maximized);
+        Platform.runLater(() -> {
+            if (primaryStage.getScene() != null) {
+                primaryStage.getScene().getRoot().applyCss();
+                primaryStage.getScene().getRoot().layout();
+            }
+            styleInterfaceSkins();
+            logScrollPane.setVvalue(1.0);
+        });
+    }
+
+    private static void setActiveThemeColors(ThemePalette theme) {
+        YELLOW = theme.mainColor();
+        CYAN = theme.accentColor();
+        MAGENTA = theme.highlightColor();
+    }
+
+    private static void recolorNodeTree(Node node, ThemePalette previous, ThemePalette updated) {
+        if (node.getStyleClass().contains("intake-theme-preview")) {
+            return;
+        }
+        String style = node.getStyle();
+        if (style != null && !style.isEmpty()) {
+            node.setStyle(replaceThemeColors(style, previous, updated));
+        }
+        if (node instanceof javafx.scene.control.Labeled labeled) {
+            labeled.setTextFill(replaceThemeColor(labeled.getTextFill(), previous, updated));
+        }
+        if (node instanceof Shape shape) {
+            shape.setFill(replaceThemeColor(shape.getFill(), previous, updated));
+            shape.setStroke(replaceThemeColor(shape.getStroke(), previous, updated));
+        }
+        if (node instanceof Parent parent) {
+            parent.getChildrenUnmodifiable().forEach(child -> recolorNodeTree(child, previous, updated));
+        }
+    }
+
+    private static String replaceThemeColors(String style, ThemePalette previous, ThemePalette updated) {
+        return style.replace(previous.mainColor(), "__INTAKE_THEME_MAIN__")
+                .replace(previous.accentColor(), "__INTAKE_THEME_ACCENT__")
+                .replace(previous.highlightColor(), "__INTAKE_THEME_HIGHLIGHT__")
+                .replace("__INTAKE_THEME_MAIN__", updated.mainColor())
+                .replace("__INTAKE_THEME_ACCENT__", updated.accentColor())
+                .replace("__INTAKE_THEME_HIGHLIGHT__", updated.highlightColor());
+    }
+
+    private static javafx.scene.paint.Paint replaceThemeColor(
+            javafx.scene.paint.Paint paint, ThemePalette previous, ThemePalette updated) {
+        if (!(paint instanceof Color color)) {
+            return paint;
+        }
+        if (color.equals(Color.web(previous.mainColor()))) {
+            return Color.web(updated.mainColor());
+        }
+        if (color.equals(Color.web(previous.accentColor()))) {
+            return Color.web(updated.accentColor());
+        }
+        if (color.equals(Color.web(previous.highlightColor()))) {
+            return Color.web(updated.highlightColor());
+        }
+        return paint;
     }
 
     private static void updateFormatSelector(ComboBox<String> selector, List<String> formats,
@@ -861,6 +1128,14 @@ public final class Main extends Application {
                 .filter(Files::isRegularFile)
                 .map(Path::toString)
                 .orElse("yt-dlp");
+    }
+
+    private static String resolveFfmpegExecutable() {
+        return packagedToolsDirectory()
+                .map(directory -> directory.resolve("ffmpeg.exe"))
+                .filter(Files::isRegularFile)
+                .map(Path::toString)
+                .orElse("ffmpeg");
     }
 
     private static ProcessBuilder createToolProcessBuilder(List<String> command) {
@@ -984,7 +1259,7 @@ public final class Main extends Application {
             };
             String requestedName = validateExtensionFileName(form.get("name"));
             DownloadItem item = enqueueDownload(
-                    createExtensionDownloadArguments(mode, mediaUri.toString(), requestedName));
+                    createExtensionDownloadArguments(mode, mediaUri.toString(), requestedName), mode);
             String jobId = UUID.randomUUID().toString();
             extensionJobs.put(jobId, item);
             appendLog("Browser extension queued " + mode.label().toLowerCase(Locale.ROOT)
@@ -1267,7 +1542,7 @@ public final class Main extends Application {
         arguments.add(outputDirectory.toString());
         arguments.add(link);
 
-        enqueueDownload(arguments);
+        enqueueDownload(arguments, mode);
         linkInput.clear();
         if (playlistSelectionToggle.isSelected()) {
             playlistItems.clear();
@@ -1330,15 +1605,54 @@ public final class Main extends Application {
         pauseButton.setStyle(primaryButtonStyle());
         pauseButton.setOnAction(event -> togglePause());
 
+        mvssToggle = new ToggleButton();
+        mvssToggle.setFont(Font.font("Monospaced", FontWeight.BOLD, 12));
+        mvssToggle.setSelected(appSettings.mvssEnabled());
+        mvssToggle.setTooltip(new Tooltip(
+                "Analyze completed audio locally and move it into MVSS vibe folders. "
+                        + "Audio completion takes longer while enabled."));
+        refreshMvssToggleAppearance();
+        mvssToggle.setOnAction(event -> toggleMvss());
+
         stateLabel = neonLabel("SYSTEMS: ONLINE", CYAN);
+        if (paused.get()) {
+            pauseButton.setText("START WORKERS");
+            pauseButton.setStyle(warningButtonStyle());
+            stateLabel.setText("SYSTEMS: SUSPENDED");
+            stateLabel.setTextFill(Color.web(MAGENTA));
+        }
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
-        HBox bar = new HBox(12, pauseButton, spacer, stateLabel);
+        HBox bar = new HBox(12, pauseButton, mvssToggle, spacer, stateLabel);
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.setPadding(new Insets(9));
         bar.setStyle("-fx-background-color: #101620; -fx-border-color: " + CYAN
                 + " transparent transparent transparent; -fx-border-width: 1 0 0 0;");
         return bar;
+    }
+
+    private void toggleMvss() {
+        boolean enabled = mvssToggle.isSelected();
+        appSettings = appSettings.withMvssEnabled(enabled);
+        refreshMvssToggleAppearance();
+        appendLog(enabled
+                ? "MVSS auto-sort armed. Completed audio will be analyzed before finalizing."
+                : "MVSS auto-sort disabled. Queued audio will finish without vibe sorting.",
+                enabled ? LogKind.SYSTEM : LogKind.WARNING);
+        AppSettings settingsSnapshot = appSettings;
+        background.execute(() -> {
+            try {
+                persistSettings(settingsSnapshot);
+            } catch (IOException failure) {
+                appendLog("Unable to persist MVSS setting: " + failure.getMessage(), LogKind.ERROR);
+            }
+        });
+    }
+
+    private void refreshMvssToggleAppearance() {
+        boolean enabled = mvssToggle.isSelected();
+        mvssToggle.setText(enabled ? "AUTO SORT VIA MVSS: ON" : "AUTO SORT VIA MVSS: OFF");
+        mvssToggle.setStyle(enabled ? primaryButtonStyle() : warningButtonStyle());
     }
 
     private void togglePause() {
@@ -1349,27 +1663,34 @@ public final class Main extends Application {
             pauseButton.setStyle(warningButtonStyle());
             stateLabel.setText("SYSTEMS: SUSPENDED");
             stateLabel.setTextFill(Color.web(MAGENTA));
-            DownloadItem item = activeItem;
-            if (item != null && item.getStatus() == DownloadStatus.DOWNLOADING) {
-                item.setStatus(DownloadStatus.PAUSED);
-            }
+            activeItems.forEach(item -> runOnFx(() -> {
+                if (item.getStatus() == DownloadStatus.DOWNLOADING) {
+                    item.setStatus(DownloadStatus.PAUSED);
+                }
+            }));
             appendLog("Worker gate paused. Process output consumption is suspended.", LogKind.WARNING);
         } else {
             pauseButton.setText("PAUSE WORKERS");
             pauseButton.setStyle(primaryButtonStyle());
             stateLabel.setText("SYSTEMS: ONLINE");
             stateLabel.setTextFill(Color.web(CYAN));
-            DownloadItem item = activeItem;
-            if (item != null && item.getStatus() == DownloadStatus.PAUSED) {
-                item.setStatus(DownloadStatus.DOWNLOADING);
-            }
+            activeItems.forEach(item -> runOnFx(() -> {
+                if (item.getStatus() == DownloadStatus.PAUSED) {
+                    item.setStatus(DownloadStatus.DOWNLOADING);
+                }
+            }));
             resumeWorkers();
             appendLog("Worker gate resumed.", LogKind.SYSTEM);
         }
     }
 
     private DownloadItem enqueueDownload(List<String> rawArguments) {
+        return enqueueDownload(rawArguments, inferDownloadMode(rawArguments));
+    }
+
+    private DownloadItem enqueueDownload(List<String> rawArguments, DownloadMode mode) {
         Objects.requireNonNull(rawArguments, "ytDlpArguments");
+        Objects.requireNonNull(mode, "downloadMode");
         List<String> arguments = rawArguments.stream()
                 .map(argument -> Objects.requireNonNull(argument, "yt-dlp argument"))
                 .toList();
@@ -1382,37 +1703,21 @@ public final class Main extends Application {
 
         DownloadItem item = createDownloadItem(deriveDisplayName(arguments));
         outstandingDownloads.incrementAndGet();
-        commandQueue.add(new DownloadCommand(arguments, item));
+        commandQueue.add(new DownloadCommand(arguments, item, mode));
         appendLog("Queued download: " + item.getName(), LogKind.SYSTEM);
         return item;
     }
 
+    private static DownloadMode inferDownloadMode(List<String> arguments) {
+        return arguments.stream().anyMatch(argument -> argument.equalsIgnoreCase("--extract-audio")
+                || argument.equalsIgnoreCase("-x")) ? DownloadMode.AUDIO : DownloadMode.VIDEO;
+    }
+
     private DownloadItem createDownloadItem(String displayName) {
-        if (Platform.isFxApplicationThread()) {
-            DownloadItem item = new DownloadItem(displayName, DownloadStatus.QUEUED, "—",
-                    Path.of("").toAbsolutePath().normalize().toString());
-            downloads.add(item);
-            return item;
-        }
-        CompletableFuture<DownloadItem> result = new CompletableFuture<>();
-        Platform.runLater(() -> {
-            try {
-                DownloadItem item = new DownloadItem(displayName, DownloadStatus.QUEUED, "—",
-                        Path.of("").toAbsolutePath().normalize().toString());
-                downloads.add(item);
-                result.complete(item);
-            } catch (Throwable throwable) {
-                result.completeExceptionally(throwable);
-            }
-        });
-        try {
-            return result.get();
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while creating a download item", interrupted);
-        } catch (ExecutionException failure) {
-            throw new IllegalStateException("Could not create a download item", failure.getCause());
-        }
+        DownloadItem item = new DownloadItem(displayName, DownloadStatus.QUEUED, "—",
+                Path.of("").toAbsolutePath().normalize().toString());
+        runOnFx(() -> downloads.add(item));
+        return item;
     }
 
     private void loadDownloadHistory() {
@@ -1438,22 +1743,17 @@ public final class Main extends Application {
     }
 
     private void markDownloadCompletedAndPersist(DownloadItem item) {
-        CompletableFuture<HistoryEntry> snapshot = new CompletableFuture<>();
         runOnFx(() -> {
             item.setProgress("100%");
             item.setStatus(DownloadStatus.COMPLETED);
-            snapshot.complete(HistoryEntry.from(item));
         });
         try {
-            HistoryEntry entry = snapshot.get();
+            HistoryEntry entry = HistoryEntry.from(item);
             synchronized (historyFileLock) {
                 Files.writeString(historyFile, entry.encode() + System.lineSeparator(), StandardCharsets.UTF_8,
                         StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
             }
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            appendLog("Download completed, but history persistence was interrupted.", LogKind.WARNING);
-        } catch (ExecutionException | IOException failure) {
+        } catch (IOException failure) {
             appendLog("Download completed, but history could not be saved: " + failure.getMessage(),
                     LogKind.WARNING);
         }
@@ -1478,23 +1778,34 @@ public final class Main extends Application {
                 Thread.currentThread().interrupt();
                 return;
             } catch (Throwable failure) {
-                reportFailure("Coordinator failure", failure, activeItem);
+                reportFailure("Coordinator failure", failure, null);
             }
         }
     }
 
     private void executeDownload(DownloadCommand command) {
         DownloadItem item = command.item();
-        activeItem = item;
+        activeItems.add(item);
         runOnFx(() -> item.setStatus(DownloadStatus.DOWNLOADING));
+        boolean completionDeferred = false;
+        Path finalPathReport = null;
 
         List<String> processArguments = new ArrayList<>();
         processArguments.add(resolveYtDlpExecutable());
         processArguments.add("--newline");
         processArguments.add("--no-color");
-        processArguments.addAll(command.arguments());
+        processArguments.add("--encoding");
+        processArguments.add("utf-8");
 
         try {
+            finalPathReport = Files.createTempFile(
+                    APPLICATION_DATA_DIRECTORY, "intake-final-path-", ".txt");
+            processArguments.add("--progress");
+            processArguments.add("--print-to-file");
+            processArguments.add("after_move:%(filepath)s");
+            processArguments.add(finalPathReport.toString());
+            processArguments.addAll(command.arguments());
+
             ProcessAttempt attempt = runDownloadAttempt(processArguments, item, "YT-DLP");
             StringBuilder completeOutput = new StringBuilder(attempt.output());
 
@@ -1517,19 +1828,111 @@ public final class Main extends Application {
             if (attempt.exitCode() != 0) {
                 throw new DownloadProcessException(attempt.exitCode(), completeOutput.toString());
             }
-            markDownloadCompletedAndPersist(item);
-            appendLog("Completed: " + item.getName(), LogKind.SUCCESS);
+            List<Path> completedFiles = readFinalDownloadedPaths(finalPathReport, item);
+            if (command.mode() == DownloadMode.AUDIO && appSettings.mvssEnabled()) {
+                completionDeferred = scheduleMvssCompletion(item, completedFiles);
+            }
+            if (!completionDeferred) {
+                markDownloadCompletedAndPersist(item);
+                appendLog("Completed: " + item.getNameSnapshot(), LogKind.SUCCESS);
+            }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             reportFailure("Download interrupted", interrupted, item);
         } catch (Throwable failure) {
             reportFailure("Download failed", unwrapCompletionFailure(failure), item);
         } finally {
-            activeProcess = null;
-            activeItem = null;
-            outstandingDownloads.decrementAndGet();
-            evaluateExtensionExit();
+            if (finalPathReport != null) {
+                try {
+                    Files.deleteIfExists(finalPathReport);
+                } catch (IOException cleanupFailure) {
+                    appendLog("Unable to remove temporary path report: "
+                            + cleanupFailure.getMessage(), LogKind.WARNING);
+                }
+            }
+            activeItems.remove(item);
+            if (!completionDeferred) {
+                finishOutstandingDownload();
+            }
         }
+    }
+
+    private List<Path> readFinalDownloadedPaths(Path report, DownloadItem item) throws IOException {
+        List<Path> completedFiles = Files.readAllLines(report, StandardCharsets.UTF_8).stream()
+                .map(String::trim)
+                .filter(line -> !line.isEmpty())
+                .map(Main::stripSurroundingQuotes)
+                .map(Path::of)
+                .map(path -> path.isAbsolute() ? path : APPLICATION_DATA_DIRECTORY.resolve(path))
+                .map(path -> path.toAbsolutePath().normalize())
+                .distinct()
+                .filter(Files::isRegularFile)
+                .toList();
+        if (completedFiles.isEmpty()) {
+            completedFiles = List.of(Path.of(item.getFileLocationSnapshot()).toAbsolutePath().normalize());
+        }
+        Path finalPath = completedFiles.get(completedFiles.size() - 1);
+        String finalName = finalPath.getFileName() == null
+                ? finalPath.toString() : finalPath.getFileName().toString();
+        item.updateFileIdentitySnapshots(finalName, finalPath.toString());
+        runOnFx(() -> {
+            item.setName(finalName);
+            item.setFileLocation(finalPath.toString());
+        });
+        return completedFiles;
+    }
+
+    private boolean scheduleMvssCompletion(DownloadItem item, List<Path> completedFiles) {
+        AppSettings settings = appSettings;
+        runOnFx(() -> item.setProgress("MVSS"));
+        appendLog("MVSS queued acoustic analysis for " + completedFiles.size()
+                + (completedFiles.size() == 1 ? " audio file." : " audio files."), LogKind.SYSTEM);
+        try {
+            mvssWorker.execute(() -> {
+                try {
+                    MusicVibeSorter.SortResult result = null;
+                    for (Path downloadedFile : completedFiles) {
+                        result = musicVibeSorter.sort(downloadedFile, settings.audioOutputDirectory());
+                        appendLog("MVSS // " + result.vibe().toUpperCase(Locale.ROOT) + " // "
+                                + result.sortedPath().getFileName() + " // " + result.classifier()
+                                + " // " + result.features().summary(), LogKind.SUCCESS);
+                    }
+                    if (result == null) {
+                        throw new IOException("MVSS received no completed audio files");
+                    }
+                    MusicVibeSorter.SortResult finalResult = result;
+                    item.updateFileIdentitySnapshots(
+                            finalResult.sortedPath().getFileName().toString(), finalResult.sortedPath().toString());
+                    runOnFx(() -> {
+                        item.setName(finalResult.sortedPath().getFileName().toString());
+                        item.setFileLocation(finalResult.sortedPath().toString());
+                    });
+                    markDownloadCompletedAndPersist(item);
+                    appendLog("Completed and sorted " + completedFiles.size() + " audio file(s).",
+                            LogKind.SUCCESS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    markDownloadCompletedAndPersist(item);
+                    reportFailure("MVSS analysis interrupted; download retained unsorted", interrupted, null);
+                } catch (Throwable failure) {
+                    markDownloadCompletedAndPersist(item);
+                    reportFailure("MVSS could not sort the download; file retained unsorted",
+                            unwrapCompletionFailure(failure), null);
+                } finally {
+                    finishOutstandingDownload();
+                }
+            });
+            return true;
+        } catch (RuntimeException rejected) {
+            appendLog("MVSS worker unavailable; download will remain unsorted: "
+                    + rejected.getMessage(), LogKind.WARNING);
+            return false;
+        }
+    }
+
+    private void finishOutstandingDownload() {
+        outstandingDownloads.decrementAndGet();
+        evaluateExtensionExit();
     }
 
     private ProcessAttempt runDownloadAttempt(List<String> processArguments, DownloadItem item,
@@ -1538,14 +1941,17 @@ public final class Main extends Application {
         ProcessBuilder builder = createToolProcessBuilder(processArguments)
                 .redirectErrorStream(true);
         Process process = builder.start();
-        activeProcess = process;
-
-        StringBuilder output = new StringBuilder(8_192);
-        CompletableFuture<Void> outputReader = CompletableFuture.runAsync(
-                () -> readProcessOutput(process, item, output, true, logSource), background);
-        int exitCode = process.waitFor();
-        outputReader.join();
-        return new ProcessAttempt(exitCode, output.toString());
+        activeProcesses.add(process);
+        try {
+            StringBuilder output = new StringBuilder(8_192);
+            CompletableFuture<Void> outputReader = CompletableFuture.runAsync(
+                    () -> readProcessOutput(process, item, output, true, logSource), background);
+            int exitCode = process.waitFor();
+            outputReader.join();
+            return new ProcessAttempt(exitCode, output.toString());
+        } finally {
+            activeProcesses.remove(process);
+        }
     }
 
     private static boolean requiresGenericImpersonation(String processOutput) {
@@ -1591,6 +1997,7 @@ public final class Main extends Application {
         if (progress.matches()) {
             String size = progress.group("size");
             String percent = progress.group("percent") + "%";
+            item.updateTransferSnapshots(size, percent);
             runOnFx(() -> {
                 item.setFileSize(size);
                 item.setProgress(percent);
@@ -1607,8 +2014,10 @@ public final class Main extends Application {
                 .or(() -> matchedGroup(MERGER_PATTERN, line, "path"));
         detectedPath.ifPresent(pathText -> {
             Path path = Path.of(stripSurroundingQuotes(pathText)).toAbsolutePath().normalize();
+            String detectedName = path.getFileName() == null ? path.toString() : path.getFileName().toString();
+            item.updateFileIdentitySnapshots(detectedName, path.toString());
             runOnFx(() -> {
-                item.setName(path.getFileName() == null ? path.toString() : path.getFileName().toString());
+                item.setName(detectedName);
                 item.setFileLocation(path.toString());
             });
         });
@@ -1666,25 +2075,48 @@ public final class Main extends Application {
     }
 
     private void appendLog(String message, LogKind kind) {
-        runOnFx(() -> {
-            if (logFlow == null) {
-                return;
-            }
-            Text timestamp = new Text("[" + LOG_TIME.format(Instant.now()) + "] ");
+        pendingLogs.add(new LogMessage(Instant.now(), message, kind));
+        scheduleLogFlush();
+    }
+
+    private void scheduleLogFlush() {
+        if (logFlushScheduled.compareAndSet(false, true)) {
+            runOnFx(this::flushPendingLogs);
+        }
+    }
+
+    private void flushPendingLogs() {
+        if (logFlow == null) {
+            pendingLogs.clear();
+            logFlushScheduled.set(false);
+            return;
+        }
+        int appended = 0;
+        LogMessage entry;
+        while (appended < LOG_FLUSH_BATCH_SIZE && (entry = pendingLogs.poll()) != null) {
+            Text timestamp = new Text("[" + LOG_TIME.format(entry.timestamp()) + "] ");
             timestamp.setFill(Color.web("#718096"));
             timestamp.setFont(Font.font("Monospaced", 12));
 
-            Text content = new Text(message + System.lineSeparator());
-            content.setFill(kind.color());
-            content.setFont(Font.font("Monospaced", kind.bold() ? FontWeight.BOLD : FontWeight.NORMAL, 12));
+            Text content = new Text(entry.message() + System.lineSeparator());
+            content.setFill(entry.kind().color());
+            content.setFont(Font.font("Monospaced",
+                    entry.kind().bold() ? FontWeight.BOLD : FontWeight.NORMAL, 12));
             logFlow.getChildren().addAll(timestamp, content);
-            int overflow = logFlow.getChildren().size() - MAX_LOG_NODES;
-            if (overflow > 0) {
-                logFlow.getChildren().remove(0, Math.min(overflow, logFlow.getChildren().size()));
-            }
+            appended++;
+        }
+        int overflow = logFlow.getChildren().size() - MAX_LOG_NODES;
+        if (overflow > 0) {
+            logFlow.getChildren().remove(0, Math.min(overflow, logFlow.getChildren().size()));
+        }
+        if (appended > 0) {
             logScrollPane.layout();
             logScrollPane.setVvalue(1.0);
-        });
+        }
+        logFlushScheduled.set(false);
+        if (!pendingLogs.isEmpty()) {
+            scheduleLogFlush();
+        }
     }
 
     private boolean installSystemTray() {
@@ -1974,8 +2406,15 @@ public final class Main extends Application {
                     properties.getProperty("audio.outputDirectory"), defaults.audioOutputDirectory());
             Path videoDirectory = configuredPath(
                     properties.getProperty("video.outputDirectory"), defaults.videoOutputDirectory());
+            boolean mvssEnabled = Boolean.parseBoolean(
+                    properties.getProperty("mvss.autoSort", Boolean.toString(defaults.mvssEnabled())));
+            ThemePalette theme = new ThemePalette(
+                    configuredThemeColor(properties.getProperty("theme.main"), defaults.theme().mainColor()),
+                    configuredThemeColor(properties.getProperty("theme.accent"), defaults.theme().accentColor()),
+                    configuredThemeColor(properties.getProperty("theme.highlight"),
+                            defaults.theme().highlightColor()));
             return new AppSettings(audioFormats, videoFormats, favoriteAudio, favoriteVideo,
-                    audioDirectory, videoDirectory);
+                    audioDirectory, videoDirectory, mvssEnabled, theme);
         } catch (IOException | RuntimeException failure) {
             System.err.println("Unable to read " + settingsFile + "; using defaults: " + failure);
             return defaults;
@@ -1990,9 +2429,15 @@ public final class Main extends Application {
         properties.setProperty("video.favorite", settings.favoriteVideoFormat());
         properties.setProperty("audio.outputDirectory", settings.audioOutputDirectory().toString());
         properties.setProperty("video.outputDirectory", settings.videoOutputDirectory().toString());
-        try (OutputStream output = Files.newOutputStream(settingsFile,
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-            properties.store(output, "iNTAKE persistent configuration");
+        properties.setProperty("mvss.autoSort", Boolean.toString(settings.mvssEnabled()));
+        properties.setProperty("theme.main", settings.theme().mainColor());
+        properties.setProperty("theme.accent", settings.theme().accentColor());
+        properties.setProperty("theme.highlight", settings.theme().highlightColor());
+        synchronized (settingsFileLock) {
+            try (OutputStream output = Files.newOutputStream(settingsFile,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                properties.store(output, "iNTAKE persistent configuration");
+            }
         }
     }
 
@@ -2014,6 +2459,11 @@ public final class Main extends Application {
     private static Path configuredPath(String rawValue, Path fallback) {
         return rawValue == null || rawValue.isBlank()
                 ? fallback : Path.of(rawValue.trim()).toAbsolutePath().normalize();
+    }
+
+    private static String configuredThemeColor(String rawValue, String fallback) {
+        return rawValue != null && rawValue.trim().matches("(?i)#[0-9a-f]{6}")
+                ? rawValue.trim().toLowerCase(Locale.ROOT) : fallback;
     }
 
     private static String configuredFavorite(String rawValue, List<String> enabledFormats,
@@ -2132,6 +2582,8 @@ public final class Main extends Application {
         private volatile String nameSnapshot;
         private volatile DownloadStatus statusSnapshot;
         private volatile String progressSnapshot;
+        private volatile String fileSizeSnapshot;
+        private volatile String fileLocationSnapshot;
         private volatile String errorSnapshot = "";
 
         public DownloadItem(String name, DownloadStatus status, String fileSize, String fileLocation) {
@@ -2143,6 +2595,8 @@ public final class Main extends Application {
             nameSnapshot = name;
             statusSnapshot = status;
             progressSnapshot = "0%";
+            fileSizeSnapshot = fileSize;
+            fileLocationSnapshot = fileLocation;
         }
 
         public String getName() { return name.get(); }
@@ -2169,22 +2623,39 @@ public final class Main extends Application {
                     : getStatus().toString();
         }
         public String getFileSize() { return fileSize.get(); }
-        public void setFileSize(String value) { fileSize.set(value); }
+        public void setFileSize(String value) {
+            fileSizeSnapshot = Objects.requireNonNull(value);
+            fileSize.set(value);
+        }
         public StringProperty fileSizeProperty() { return fileSize; }
         public String getFileLocation() { return fileLocation.get(); }
-        public void setFileLocation(String value) { fileLocation.set(value); }
+        public void setFileLocation(String value) {
+            fileLocationSnapshot = Objects.requireNonNull(value);
+            fileLocation.set(value);
+        }
         public StringProperty fileLocationProperty() { return fileLocation; }
         public String getNameSnapshot() { return nameSnapshot; }
         public DownloadStatus getStatusSnapshot() { return statusSnapshot; }
         public String getProgressSnapshot() { return progressSnapshot; }
+        public String getFileSizeSnapshot() { return fileSizeSnapshot; }
+        public String getFileLocationSnapshot() { return fileLocationSnapshot; }
         public String getErrorSnapshot() { return errorSnapshot; }
         public void setErrorSnapshot(String value) { errorSnapshot = Objects.requireNonNull(value); }
+        public void updateTransferSnapshots(String size, String transferProgress) {
+            fileSizeSnapshot = Objects.requireNonNull(size);
+            progressSnapshot = Objects.requireNonNull(transferProgress);
+        }
+        public void updateFileIdentitySnapshots(String fileName, String location) {
+            nameSnapshot = Objects.requireNonNull(fileName);
+            fileLocationSnapshot = Objects.requireNonNull(location);
+        }
     }
 
-    private record DownloadCommand(List<String> arguments, DownloadItem item) {
+    private record DownloadCommand(List<String> arguments, DownloadItem item, DownloadMode mode) {
         private DownloadCommand {
             arguments = List.copyOf(arguments);
             Objects.requireNonNull(item);
+            Objects.requireNonNull(mode);
         }
     }
 
@@ -2194,9 +2665,55 @@ public final class Main extends Application {
         }
     }
 
+    private record ThemePalette(String mainColor, String accentColor, String highlightColor) {
+        private ThemePalette {
+            mainColor = normalize(mainColor, "main");
+            accentColor = normalize(accentColor, "accent");
+            highlightColor = normalize(highlightColor, "highlight");
+            if (mainColor.equals(accentColor) || mainColor.equals(highlightColor)
+                    || accentColor.equals(highlightColor)) {
+                throw new IllegalArgumentException("Main, accent, and highlight colors must be distinct");
+            }
+        }
+
+        private static ThemePalette defaults() {
+            return new ThemePalette(DEFAULT_MAIN_COLOR, DEFAULT_ACCENT_COLOR, DEFAULT_HIGHLIGHT_COLOR);
+        }
+
+        private static String normalize(String value, String role) {
+            if (value == null || !value.trim().matches("(?i)#[0-9a-f]{6}")) {
+                throw new IllegalArgumentException("Invalid " + role + " theme color: " + value);
+            }
+            return value.trim().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    private record ThemePreset(String name, ThemePalette palette) {
+        private ThemePreset {
+            Objects.requireNonNull(name);
+            Objects.requireNonNull(palette);
+        }
+
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
+    private record ThemeEditor(VBox root, ColorPicker mainColor,
+                               ColorPicker accentColor, ColorPicker highlightColor) {
+        private ThemeEditor {
+            Objects.requireNonNull(root);
+            Objects.requireNonNull(mainColor);
+            Objects.requireNonNull(accentColor);
+            Objects.requireNonNull(highlightColor);
+        }
+    }
+
     private record AppSettings(List<String> audioFormats, List<String> videoFormats,
                                String favoriteAudioFormat, String favoriteVideoFormat,
-                               Path audioOutputDirectory, Path videoOutputDirectory) {
+                               Path audioOutputDirectory, Path videoOutputDirectory,
+                               boolean mvssEnabled, ThemePalette theme) {
         private AppSettings {
             audioFormats = List.copyOf(audioFormats);
             videoFormats = List.copyOf(videoFormats);
@@ -2204,6 +2721,7 @@ public final class Main extends Application {
             Objects.requireNonNull(favoriteVideoFormat);
             Objects.requireNonNull(audioOutputDirectory);
             Objects.requireNonNull(videoOutputDirectory);
+            Objects.requireNonNull(theme);
             if (audioFormats.isEmpty() || videoFormats.isEmpty()) {
                 throw new IllegalArgumentException("Audio and video format lists cannot be empty");
             }
@@ -2218,7 +2736,12 @@ public final class Main extends Application {
                     ? Path.of(System.getProperty("user.home"), "Downloads", "iNTAKE")
                     : Path.of("").toAbsolutePath().normalize();
             return new AppSettings(DEFAULT_AUDIO_FORMATS, DEFAULT_VIDEO_FORMATS, "mp3", "mp4",
-                    workingDirectory, workingDirectory);
+                    workingDirectory, workingDirectory, false, ThemePalette.defaults());
+        }
+
+        private AppSettings withMvssEnabled(boolean enabled) {
+            return new AppSettings(audioFormats, videoFormats, favoriteAudioFormat, favoriteVideoFormat,
+                    audioOutputDirectory, videoOutputDirectory, enabled, theme);
         }
     }
 
@@ -2234,7 +2757,8 @@ public final class Main extends Application {
         }
 
         private static HistoryEntry from(DownloadItem item) {
-            return new HistoryEntry(Instant.now(), item.getName(), item.getFileSize(), item.getFileLocation());
+            return new HistoryEntry(Instant.now(), item.getNameSnapshot(), item.getFileSizeSnapshot(),
+                    item.getFileLocationSnapshot());
         }
 
         private String encode() {
@@ -2260,22 +2784,35 @@ public final class Main extends Application {
         }
     }
 
-    private enum LogKind {
-        NORMAL(TEXT, false),
-        SYSTEM(CYAN, false),
-        SUCCESS(YELLOW, true),
-        WARNING(MAGENTA, true),
-        ERROR(MAGENTA, false);
+    private record LogMessage(Instant timestamp, String message, LogKind kind) {
+        private LogMessage {
+            Objects.requireNonNull(timestamp);
+            Objects.requireNonNull(message);
+            Objects.requireNonNull(kind);
+        }
+    }
 
-        private final Color color;
+    private enum LogKind {
+        NORMAL(false),
+        SYSTEM(false),
+        SUCCESS(true),
+        WARNING(true),
+        ERROR(false);
+
         private final boolean bold;
 
-        LogKind(String color, boolean bold) {
-            this.color = Color.web(color);
+        LogKind(boolean bold) {
             this.bold = bold;
         }
 
-        Color color() { return color; }
+        Color color() {
+            return Color.web(switch (this) {
+                case NORMAL -> TEXT;
+                case SYSTEM -> CYAN;
+                case SUCCESS -> YELLOW;
+                case WARNING, ERROR -> MAGENTA;
+            });
+        }
         boolean bold() { return bold; }
     }
 
