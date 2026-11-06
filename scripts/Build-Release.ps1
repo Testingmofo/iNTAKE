@@ -10,8 +10,8 @@ $stagingDirectory = Join-Path $projectRoot '.release-build'
 $packageInput = Join-Path $stagingDirectory 'input'
 $imageDirectory = Join-Path $stagingDirectory 'image'
 $applicationImage = Join-Path $imageDirectory 'iNTAKE'
-$version = '0.2.0'
-$releaseLabel = '0.2.0-beta'
+$version = '0.2.1'
+$releaseLabel = '0.2.1-beta'
 $pomPath = Join-Path $projectRoot 'pom.xml'
 [xml]$pomDocument = Get-Content -LiteralPath $pomPath -Raw
 $mavenArtifactVersion = [string]$pomDocument.project.version
@@ -141,6 +141,16 @@ Add-Type -Path (Join-Path $projectRoot 'native-host\IntakeNativeHost.cs') `
     -ReferencedAssemblies 'System.Web.Extensions.dll'
 
 Write-Host '[iNTAKE] Creating self-contained portable image...' -ForegroundColor Cyan
+$uninstallLauncherProperties = Join-Path $stagingDirectory 'uninstall-launcher.properties'
+[IO.File]::WriteAllLines(
+    $uninstallLauncherProperties,
+    @(
+        'main-class=UninstallLauncher',
+        'win-console=false',
+        'win-menu=true',
+        'win-shortcut=false'
+    ),
+    [Text.UTF8Encoding]::new($false))
 Invoke-Checked $jpackage @(
     '--type', 'app-image',
     '--dest', $imageDirectory,
@@ -153,6 +163,7 @@ Invoke-Checked $jpackage @(
     '--description', 'iNTAKE Media NetCrawler',
     '--add-modules', 'java.desktop,java.net.http,jdk.httpserver,jdk.unsupported,java.logging,java.xml,jdk.crypto.ec',
     '--java-options', '-Dfile.encoding=UTF-8'
+    '--add-launcher', "Uninstall iNTAKE=$uninstallLauncherProperties"
 )
 
 $portableArchive = Join-Path $releaseDirectory ("iNTAKE-Portable-$releaseLabel.zip")

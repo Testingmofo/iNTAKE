@@ -28,6 +28,7 @@ import javafx.scene.control.Separator;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableView;
+import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.Tooltip;
 import javafx.scene.control.ToggleButton;
@@ -82,11 +83,13 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -615,15 +618,38 @@ public final class Main extends Application {
         HBox favoritesRow = new HBox(18, favoriteAudioBox, favoriteVideoBox);
         favoritesRow.setAlignment(Pos.CENTER_LEFT);
 
+        ComboBox<CookieBrowser> youtubeCookies = new ComboBox<>(
+                FXCollections.observableArrayList(CookieBrowser.values()));
+        youtubeCookies.setValue(appSettings.youtubeCookieBrowser());
+        youtubeCookies.setPrefWidth(220);
+        youtubeCookies.setStyle("-fx-background-color: #080a0f; -fx-border-color: " + CYAN
+                + "; -fx-border-width: 1; -fx-background-radius: 0; -fx-border-radius: 0;"
+                + " -fx-font-family: 'Monospaced';");
+        Label cookieWarning = new Label(
+                "OFF BY DEFAULT // Uses your selected browser session only for YouTube requests. "
+                        + "Sign in and complete any CAPTCHA in that browser first. Account use carries "
+                        + "a temporary or permanent YouTube restriction risk.");
+        cookieWarning.setWrapText(true);
+        cookieWarning.setTextFill(Color.web("#8ca3b8"));
+        cookieWarning.setFont(Font.font("Monospaced", 10));
+        VBox youtubeAccessBox = new VBox(6,
+                settingsSectionLabel("YOUTUBE SESSION // COOKIES FROM BROWSER", CYAN),
+                youtubeCookies, cookieWarning);
+
         TextField audioPath = createSettingsPathField(appSettings.audioOutputDirectory());
         TextField videoPath = createSettingsPathField(appSettings.videoOutputDirectory());
         ThemeEditor themeEditor = createThemeEditor(appSettings.theme());
+        TextArea mvssTopics = createMvssTopicEditor(appSettings.mvssTopics());
 
         VBox editor = new VBox(12,
                 settingsSectionLabel("FORMAT ROUTING", CYAN),
                 filetypeMenu,
                 favoritesRow,
+                youtubeAccessBox,
                 themeEditor.root(),
+                settingsSectionLabel("MVSS AUDIO THEMES // TOPICS", CYAN),
+                mvssTopics,
+                mvssTopicHelp(),
                 settingsSectionLabel("AUDIO DOWNLOAD LOCATION", YELLOW),
                 createDirectoryEditor(audioPath, "Choose audio download directory"),
                 settingsSectionLabel("VIDEO DOWNLOAD LOCATION", YELLOW),
@@ -642,7 +668,8 @@ public final class Main extends Application {
         save.setStyle(primaryButtonStyle());
         save.setOnAction(event -> saveSettingsFromEditor(
                 audioChecks, videoChecks, favoriteAudio, favoriteVideo, audioPath, videoPath,
-                themeEditor.mainColor(), themeEditor.accentColor(), themeEditor.highlightColor()));
+                themeEditor.mainColor(), themeEditor.accentColor(), themeEditor.highlightColor(),
+                mvssTopics, youtubeCookies));
         Region footerSpacer = new Region();
         HBox.setHgrow(footerSpacer, Priority.ALWAYS);
         HBox footer = new HBox(10, configLocation, footerSpacer, cancel, save);
@@ -666,7 +693,7 @@ public final class Main extends Application {
         settingsStage.initOwner(primaryStage);
         settingsStage.initModality(Modality.WINDOW_MODAL);
         settingsStage.setTitle("iNTAKE // Configuration");
-        settingsStage.setScene(new Scene(settingsRoot, 760, 680, Color.TRANSPARENT));
+        settingsStage.setScene(new Scene(settingsRoot, 760, 760, Color.TRANSPARENT));
         settingsStage.setMinWidth(620);
         settingsStage.setMinHeight(560);
         settingsStage.setOnCloseRequest(event -> {
@@ -894,11 +921,38 @@ public final class Main extends Application {
         return field;
     }
 
+    private TextArea createMvssTopicEditor(List<MusicVibeSorter.Topic> topics) {
+        TextArea editor = new TextArea(formatMvssTopics(topics));
+        editor.setPromptText("Topic name | keyword, keyword, keyword");
+        editor.setPrefRowCount(Math.min(9, Math.max(5, topics.size())));
+        editor.setWrapText(false);
+        editor.setStyle("-fx-control-inner-background: #080a0f; -fx-background-color: #080a0f;"
+                + " -fx-text-fill: " + TEXT + "; -fx-highlight-fill: " + CYAN + ";"
+                + " -fx-highlight-text-fill: #080a0f; -fx-border-color: " + CYAN + ";"
+                + " -fx-border-width: 1; -fx-background-radius: 0; -fx-border-radius: 0;"
+                + " -fx-font-family: 'Monospaced'; -fx-font-size: 11px;");
+        editor.setTooltip(new Tooltip(
+                "One destination folder per line. Keywords help offline matching; a local Ollama model "
+                        + "can also choose from these topics."));
+        return editor;
+    }
+
+    private Label mvssTopicHelp() {
+        Label help = new Label(
+                "ONE PER LINE // Topic | optional filename and mood hints separated by commas\n"
+                        + "MVSS creates Audio Location\\MVSS\\Topic. Keep descriptive hints for offline sorting.");
+        help.setWrapText(true);
+        help.setTextFill(Color.web("#8ca3b8"));
+        help.setFont(Font.font("Monospaced", 10));
+        return help;
+    }
+
     private void saveSettingsFromEditor(List<CheckBox> audioChecks, List<CheckBox> videoChecks,
                                         ComboBox<String> favoriteAudio, ComboBox<String> favoriteVideo,
                                         TextField audioPath, TextField videoPath,
                                         ColorPicker mainColor, ColorPicker accentColor,
-                                        ColorPicker highlightColor) {
+                                        ColorPicker highlightColor, TextArea mvssTopicsEditor,
+                                        ComboBox<CookieBrowser> youtubeCookies) {
         List<String> selectedAudio = selectedFormats(audioChecks);
         List<String> selectedVideo = selectedFormats(videoChecks);
         if (selectedAudio.isEmpty() || selectedVideo.isEmpty()) {
@@ -915,11 +969,15 @@ public final class Main extends Application {
             ThemePalette selectedTheme = new ThemePalette(
                     toHex(mainColor.getValue()), toHex(accentColor.getValue()),
                     toHex(highlightColor.getValue()));
+            List<MusicVibeSorter.Topic> mvssTopics = parseMvssTopics(mvssTopicsEditor.getText());
+            CookieBrowser selectedCookieBrowser = Optional.ofNullable(youtubeCookies.getValue())
+                    .orElse(CookieBrowser.OFF);
             Files.createDirectories(audioDirectory);
             Files.createDirectories(videoDirectory);
             AppSettings updated = new AppSettings(
                     selectedAudio, selectedVideo, selectedFavoriteAudio, selectedFavoriteVideo,
-                    audioDirectory, videoDirectory, appSettings.mvssEnabled(), selectedTheme);
+                    audioDirectory, videoDirectory, appSettings.mvssEnabled(), selectedTheme,
+                    mvssTopics, selectedCookieBrowser);
             persistSettings(updated);
             appSettings = updated;
             applyTheme(selectedTheme);
@@ -1315,6 +1373,7 @@ public final class Main extends Application {
         if (mode == DownloadMode.AUDIO) {
             String format = settings.favoriteAudioFormat();
             arguments.addAll(List.of(
+                    "--format", "bestaudio/best",
                     "--extract-audio", "--audio-format", format,
                     "--embed-thumbnail", "--add-metadata"));
             arguments.add("--paths");
@@ -1518,6 +1577,7 @@ public final class Main extends Application {
         List<String> arguments = new ArrayList<>();
         if (mode == DownloadMode.AUDIO) {
             arguments.addAll(List.of(
+                    "--format", "bestaudio/best",
                     "--extract-audio",
                     "--audio-format", normalizedFormat,
                     "--embed-thumbnail",
@@ -1798,6 +1858,21 @@ public final class Main extends Application {
         processArguments.add("utf-8");
 
         try {
+            AppSettings settingsSnapshot = appSettings;
+            boolean youtubeRequest = isYouTubeRequest(command.arguments());
+            if (youtubeRequest) {
+                // A small metadata-request delay reduces the chance of escalating a
+                // temporary YouTube rate limit. It does not attempt to bypass one.
+                processArguments.add("--sleep-requests");
+                processArguments.add("1");
+                CookieBrowser browser = settingsSnapshot.youtubeCookieBrowser();
+                if (browser != CookieBrowser.OFF) {
+                    processArguments.add("--cookies-from-browser");
+                    processArguments.add(browser.cliName());
+                    appendLog("YouTube session enabled from " + browser.displayName()
+                            + ". Browser cookies remain managed by yt-dlp.", LogKind.SYSTEM);
+                }
+            }
             finalPathReport = Files.createTempFile(
                     APPLICATION_DATA_DIRECTORY, "intake-final-path-", ".txt");
             processArguments.add("--progress");
@@ -1826,6 +1901,16 @@ public final class Main extends Application {
             }
 
             if (attempt.exitCode() != 0) {
+                if (youtubeRequest && requiresYouTubeAuthentication(attempt.output())) {
+                    appendLog(settingsSnapshot.youtubeCookieBrowser() == CookieBrowser.OFF
+                                    ? "YouTube blocked this IP/session. Open the video in a browser, "
+                                    + "complete any CAPTCHA, then select that browser under Settings > "
+                                    + "YouTube Session. Do not share exported cookies or account data."
+                                    : "YouTube rejected the selected browser session. Open the video in "
+                                    + settingsSnapshot.youtubeCookieBrowser().displayName()
+                                    + ", complete any CAPTCHA, allow the rate limit to cool down, and retry.",
+                            LogKind.WARNING);
+                }
                 throw new DownloadProcessException(attempt.exitCode(), completeOutput.toString());
             }
             List<Path> completedFiles = readFinalDownloadedPaths(finalPathReport, item);
@@ -1892,7 +1977,8 @@ public final class Main extends Application {
                 try {
                     MusicVibeSorter.SortResult result = null;
                     for (Path downloadedFile : completedFiles) {
-                        result = musicVibeSorter.sort(downloadedFile, settings.audioOutputDirectory());
+                        result = musicVibeSorter.sort(downloadedFile, settings.audioOutputDirectory(),
+                                settings.mvssTopics());
                         appendLog("MVSS // " + result.vibe().toUpperCase(Locale.ROOT) + " // "
                                 + result.sortedPath().getFileName() + " // " + result.classifier()
                                 + " // " + result.features().summary(), LogKind.SUCCESS);
@@ -1964,6 +2050,23 @@ public final class Main extends Application {
         return arguments.stream()
                 .map(argument -> argument.toLowerCase(Locale.ROOT))
                 .anyMatch(argument -> argument.contains("generic:impersonate"));
+    }
+
+    private static boolean isYouTubeRequest(List<String> arguments) {
+        return arguments.stream().map(argument -> argument.toLowerCase(Locale.ROOT))
+                .anyMatch(argument -> argument.contains("youtube.com/")
+                        || argument.contains("youtu.be/")
+                        || argument.contains("music.youtube.com/"));
+    }
+
+    private static boolean requiresYouTubeAuthentication(String processOutput) {
+        String normalized = processOutput.toLowerCase(Locale.ROOT);
+        return normalized.contains("sign in to confirm you’re not a bot")
+                || normalized.contains("sign in to confirm you're not a bot")
+                || normalized.contains("http error 429")
+                || normalized.contains("too many requests")
+                || normalized.contains("use --cookies-from-browser")
+                || normalized.contains("unable to fetch gvs po token");
     }
 
     private void readProcessOutput(Process process, DownloadItem item, StringBuilder capture,
@@ -2408,13 +2511,18 @@ public final class Main extends Application {
                     properties.getProperty("video.outputDirectory"), defaults.videoOutputDirectory());
             boolean mvssEnabled = Boolean.parseBoolean(
                     properties.getProperty("mvss.autoSort", Boolean.toString(defaults.mvssEnabled())));
+            List<MusicVibeSorter.Topic> mvssTopics = configuredMvssTopics(
+                    properties.getProperty("mvss.topics"), defaults.mvssTopics());
+            CookieBrowser youtubeCookieBrowser = CookieBrowser.fromConfig(
+                    properties.getProperty("youtube.cookiesFromBrowser"));
             ThemePalette theme = new ThemePalette(
                     configuredThemeColor(properties.getProperty("theme.main"), defaults.theme().mainColor()),
                     configuredThemeColor(properties.getProperty("theme.accent"), defaults.theme().accentColor()),
                     configuredThemeColor(properties.getProperty("theme.highlight"),
                             defaults.theme().highlightColor()));
             return new AppSettings(audioFormats, videoFormats, favoriteAudio, favoriteVideo,
-                    audioDirectory, videoDirectory, mvssEnabled, theme);
+                    audioDirectory, videoDirectory, mvssEnabled, theme, mvssTopics,
+                    youtubeCookieBrowser);
         } catch (IOException | RuntimeException failure) {
             System.err.println("Unable to read " + settingsFile + "; using defaults: " + failure);
             return defaults;
@@ -2430,6 +2538,9 @@ public final class Main extends Application {
         properties.setProperty("audio.outputDirectory", settings.audioOutputDirectory().toString());
         properties.setProperty("video.outputDirectory", settings.videoOutputDirectory().toString());
         properties.setProperty("mvss.autoSort", Boolean.toString(settings.mvssEnabled()));
+        properties.setProperty("mvss.topics", encodeMvssTopics(settings.mvssTopics()));
+        properties.setProperty("youtube.cookiesFromBrowser",
+                settings.youtubeCookieBrowser().cliName());
         properties.setProperty("theme.main", settings.theme().mainColor());
         properties.setProperty("theme.accent", settings.theme().accentColor());
         properties.setProperty("theme.highlight", settings.theme().highlightColor());
@@ -2473,6 +2584,93 @@ public final class Main extends Application {
             return normalized;
         }
         return enabledFormats.contains(preferredDefault) ? preferredDefault : enabledFormats.get(0);
+    }
+
+    private static String formatMvssTopics(List<MusicVibeSorter.Topic> topics) {
+        return topics.stream()
+                .map(topic -> topic.name() + (topic.hints().isEmpty() ? ""
+                        : " | " + String.join(", ", topic.hints())))
+                .reduce((left, right) -> left + System.lineSeparator() + right)
+                .orElse("");
+    }
+
+    private static List<MusicVibeSorter.Topic> parseMvssTopics(String text) {
+        if (text == null || text.isBlank()) {
+            throw new IllegalArgumentException("Add at least one MVSS audio topic");
+        }
+        List<MusicVibeSorter.Topic> topics = new ArrayList<>();
+        Set<String> names = new HashSet<>();
+        int lineNumber = 0;
+        for (String rawLine : text.split("\\R")) {
+            lineNumber++;
+            String line = rawLine.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            String[] parts = line.split("\\|", 2);
+            String name = parts[0].trim();
+            List<String> hints = new ArrayList<>();
+            if (parts.length == 2) {
+                for (String hint : parts[1].split(",")) {
+                    if (!hint.isBlank()) {
+                        hints.add(hint.trim());
+                    }
+                }
+            }
+            try {
+                MusicVibeSorter.Topic topic = new MusicVibeSorter.Topic(name, hints);
+                if (!names.add(topic.name().toLowerCase(Locale.ROOT))) {
+                    throw new IllegalArgumentException("Duplicate MVSS topic: " + topic.name());
+                }
+                topics.add(topic);
+            } catch (IllegalArgumentException invalid) {
+                throw new IllegalArgumentException(
+                        "MVSS topic line " + lineNumber + ": " + invalid.getMessage(), invalid);
+            }
+        }
+        if (topics.isEmpty()) {
+            throw new IllegalArgumentException("Add at least one MVSS audio topic");
+        }
+        if (topics.size() > 32) {
+            throw new IllegalArgumentException("MVSS supports at most 32 audio topics");
+        }
+        return List.copyOf(topics);
+    }
+
+    private static String encodeMvssTopics(List<MusicVibeSorter.Topic> topics) {
+        Base64.Encoder encoder = Base64.getUrlEncoder().withoutPadding();
+        return topics.stream().map(topic ->
+                        encoder.encodeToString(topic.name().getBytes(StandardCharsets.UTF_8)) + "."
+                                + encoder.encodeToString(String.join("\u001f", topic.hints())
+                                .getBytes(StandardCharsets.UTF_8)))
+                .reduce((left, right) -> left + ";" + right).orElseThrow();
+    }
+
+    private static List<MusicVibeSorter.Topic> configuredMvssTopics(
+            String encoded, List<MusicVibeSorter.Topic> defaults) {
+        if (encoded == null || encoded.isBlank()) {
+            return defaults;
+        }
+        try {
+            Base64.Decoder decoder = Base64.getUrlDecoder();
+            StringBuilder editable = new StringBuilder();
+            for (String token : encoded.split(";")) {
+                String[] parts = token.split("\\.", 2);
+                if (parts.length != 2) {
+                    throw new IllegalArgumentException("Malformed MVSS topic configuration");
+                }
+                String name = new String(decoder.decode(parts[0]), StandardCharsets.UTF_8);
+                String hints = new String(decoder.decode(parts[1]), StandardCharsets.UTF_8)
+                        .replace('\u001f', ',');
+                if (!editable.isEmpty()) {
+                    editable.append('\n');
+                }
+                editable.append(name).append(" | ").append(hints);
+            }
+            return parseMvssTopics(editable.toString());
+        } catch (IllegalArgumentException invalid) {
+            return defaults;
+        }
     }
 
     private static String[] displayFormats(List<String> formats) {
@@ -2552,6 +2750,41 @@ public final class Main extends Application {
 
         String label() { return label; }
         String defaultFormat() { return defaultFormat; }
+    }
+
+    private enum CookieBrowser {
+        OFF("Off (anonymous)", "off"),
+        FIREFOX("Firefox", "firefox"),
+        CHROME("Google Chrome", "chrome"),
+        EDGE("Microsoft Edge", "edge"),
+        BRAVE("Brave", "brave"),
+        VIVALDI("Vivaldi", "vivaldi"),
+        OPERA("Opera", "opera");
+
+        private final String displayName;
+        private final String cliName;
+
+        CookieBrowser(String displayName, String cliName) {
+            this.displayName = displayName;
+            this.cliName = cliName;
+        }
+
+        String displayName() { return displayName; }
+        String cliName() { return cliName; }
+
+        static CookieBrowser fromConfig(String value) {
+            if (value != null) {
+                for (CookieBrowser browser : values()) {
+                    if (browser.cliName.equalsIgnoreCase(value.trim())) {
+                        return browser;
+                    }
+                }
+            }
+            return OFF;
+        }
+
+        @Override
+        public String toString() { return displayName; }
     }
 
     public enum DownloadStatus {
@@ -2713,7 +2946,9 @@ public final class Main extends Application {
     private record AppSettings(List<String> audioFormats, List<String> videoFormats,
                                String favoriteAudioFormat, String favoriteVideoFormat,
                                Path audioOutputDirectory, Path videoOutputDirectory,
-                               boolean mvssEnabled, ThemePalette theme) {
+                               boolean mvssEnabled, ThemePalette theme,
+                               List<MusicVibeSorter.Topic> mvssTopics,
+                               CookieBrowser youtubeCookieBrowser) {
         private AppSettings {
             audioFormats = List.copyOf(audioFormats);
             videoFormats = List.copyOf(videoFormats);
@@ -2722,12 +2957,17 @@ public final class Main extends Application {
             Objects.requireNonNull(audioOutputDirectory);
             Objects.requireNonNull(videoOutputDirectory);
             Objects.requireNonNull(theme);
+            mvssTopics = List.copyOf(Objects.requireNonNull(mvssTopics));
+            Objects.requireNonNull(youtubeCookieBrowser);
             if (audioFormats.isEmpty() || videoFormats.isEmpty()) {
                 throw new IllegalArgumentException("Audio and video format lists cannot be empty");
             }
             if (!audioFormats.contains(favoriteAudioFormat)
                     || !videoFormats.contains(favoriteVideoFormat)) {
                 throw new IllegalArgumentException("Favorite formats must be enabled");
+            }
+            if (mvssTopics.isEmpty()) {
+                throw new IllegalArgumentException("MVSS topic list cannot be empty");
             }
         }
 
@@ -2736,12 +2976,14 @@ public final class Main extends Application {
                     ? Path.of(System.getProperty("user.home"), "Downloads", "iNTAKE")
                     : Path.of("").toAbsolutePath().normalize();
             return new AppSettings(DEFAULT_AUDIO_FORMATS, DEFAULT_VIDEO_FORMATS, "mp3", "mp4",
-                    workingDirectory, workingDirectory, false, ThemePalette.defaults());
+                    workingDirectory, workingDirectory, false, ThemePalette.defaults(),
+                    MusicVibeSorter.defaultTopics(), CookieBrowser.OFF);
         }
 
         private AppSettings withMvssEnabled(boolean enabled) {
             return new AppSettings(audioFormats, videoFormats, favoriteAudioFormat, favoriteVideoFormat,
-                    audioOutputDirectory, videoOutputDirectory, enabled, theme);
+                    audioOutputDirectory, videoOutputDirectory, enabled, theme, mvssTopics,
+                    youtubeCookieBrowser);
         }
     }
 

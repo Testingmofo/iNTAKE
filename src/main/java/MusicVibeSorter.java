@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -35,9 +37,15 @@ public final class MusicVibeSorter {
     private static final URI OLLAMA_TAGS = URI.create("http://127.0.0.1:11434/api/tags");
     private static final URI OLLAMA_GENERATE = URI.create("http://127.0.0.1:11434/api/generate");
     private static final Pattern MODEL_NAME = Pattern.compile("\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
-    private static final List<Vibe> VIBES = List.of(
-            Vibe.ENERGETIC, Vibe.CHILL, Vibe.DARK, Vibe.BRIGHT,
-            Vibe.MELANCHOLIC, Vibe.ATMOSPHERIC);
+    private static final Pattern OLLAMA_RESPONSE = Pattern.compile(
+            "\\\"response\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"");
+    private static final List<Topic> DEFAULT_TOPICS = List.of(
+            new Topic("Energetic", List.of("energy", "workout", "dance", "hardstyle", "rave", "fast")),
+            new Topic("Chill", List.of("chill", "lofi", "sleep", "calm", "relax", "acoustic")),
+            new Topic("Dark", List.of("dark", "night", "doom", "death", "shadow", "villain", "goth")),
+            new Topic("Bright", List.of("happy", "sun", "summer", "smile", "party", "love", "bright")),
+            new Topic("Melancholic", List.of("sad", "cry", "lonely", "goodbye", "broken", "rain", "melancholy")),
+            new Topic("Atmospheric", List.of("ambient", "dream", "space", "ethereal", "cinematic", "atmospheric")));
 
     private final String ffmpegExecutable;
     private final HttpClient httpClient;
@@ -49,20 +57,33 @@ public final class MusicVibeSorter {
                 .build();
     }
 
+    public static List<Topic> defaultTopics() {
+        return DEFAULT_TOPICS;
+    }
+
     public SortResult sort(Path audioFile, Path audioLibrary) throws IOException, InterruptedException {
+        return sort(audioFile, audioLibrary, DEFAULT_TOPICS);
+    }
+
+    public SortResult sort(Path audioFile, Path audioLibrary, List<Topic> configuredTopics)
+            throws IOException, InterruptedException {
         Path source = requireSortableFile(audioFile, audioLibrary);
+        List<Topic> topics = normalizeTopics(configuredTopics);
         AudioFeatures features = analyze(source);
-        Vibe heuristic = classifyHeuristically(source.getFileName().toString(), features);
-        Optional<Vibe> modelVibe = classifyWithLocalModel(source.getFileName().toString(), features);
-        Vibe selected = modelVibe.orElse(heuristic);
+        Archetype archetype = classifyArchetype(source.getFileName().toString(), features);
+        Topic heuristic = classifyConfiguredTopic(
+                source.getFileName().toString(), archetype, topics);
+        Optional<Topic> modelTopic = classifyWithLocalModel(
+                source.getFileName().toString(), features, topics);
+        Topic selected = modelTopic.orElse(heuristic);
 
         Path root = audioLibrary.toAbsolutePath().normalize();
-        Path destinationDirectory = root.resolve("MVSS").resolve(selected.directoryName());
+        Path destinationDirectory = root.resolve("MVSS").resolve(selected.name());
         Files.createDirectories(destinationDirectory);
         Path destination = uniqueDestination(destinationDirectory.resolve(source.getFileName()));
         move(source, destination);
-        return new SortResult(source, destination, selected.displayName(), features,
-                modelVibe.isPresent() ? "Ollama local model" : "MVSS acoustic engine");
+        return new SortResult(source, destination, selected.name(), features,
+                modelTopic.isPresent() ? "Ollama local model" : "MVSS acoustic engine");
     }
 
     private AudioFeatures analyze(Path source) throws IOException, InterruptedException {
@@ -175,45 +196,82 @@ public final class MusicVibeSorter {
         return 1_200.0 / bestLag;
     }
 
-    private static Vibe classifyHeuristically(String fileName, AudioFeatures features) {
+    private static Archetype classifyArchetype(String fileName, AudioFeatures features) {
         String name = fileName.toLowerCase(Locale.ROOT);
         if (containsAny(name, "sad", "cry", "lonely", "goodbye", "broken", "rain", "melanchol")) {
-            return Vibe.MELANCHOLIC;
+            return Archetype.MELANCHOLIC;
         }
         if (containsAny(name, "dark", "night", "doom", "death", "shadow", "villain", "goth")) {
-            return Vibe.DARK;
+            return Archetype.DARK;
         }
         if (containsAny(name, "happy", "sun", "summer", "smile", "party", "love", "bright")) {
-            return Vibe.BRIGHT;
+            return Archetype.BRIGHT;
         }
         if (containsAny(name, "ambient", "dream", "space", "ethereal", "cinematic", "atmos")) {
-            return Vibe.ATMOSPHERIC;
+            return Archetype.ATMOSPHERIC;
         }
         if (containsAny(name, "chill", "lofi", "sleep", "calm", "relax", "acoustic")) {
-            return Vibe.CHILL;
+            return Archetype.CHILL;
         }
         if (containsAny(name, "energetic", "energy", "workout", "dance", "hardstyle", "rave")) {
-            return Vibe.ENERGETIC;
+            return Archetype.ENERGETIC;
         }
         if (features.bpm() >= 128.0 || (features.energy() > 0.62 && features.brightness() > 0.42)) {
-            return Vibe.ENERGETIC;
+            return Archetype.ENERGETIC;
         }
         if (features.energy() < 0.28 && features.dynamics() > 0.50) {
-            return Vibe.ATMOSPHERIC;
+            return Archetype.ATMOSPHERIC;
         }
         if (features.energy() < 0.42 && features.bpm() < 105.0) {
-            return Vibe.CHILL;
+            return Archetype.CHILL;
         }
         if (features.brightness() < 0.27 && features.energy() > 0.42) {
-            return Vibe.DARK;
+            return Archetype.DARK;
         }
         if (features.brightness() > 0.58 && features.zeroCrossing() > 0.34) {
-            return Vibe.BRIGHT;
+            return Archetype.BRIGHT;
         }
-        return features.dynamics() > 0.62 ? Vibe.MELANCHOLIC : Vibe.CHILL;
+        return features.dynamics() > 0.62 ? Archetype.MELANCHOLIC : Archetype.CHILL;
     }
 
-    private Optional<Vibe> classifyWithLocalModel(String fileName, AudioFeatures features) {
+    private static Topic classifyConfiguredTopic(String fileName, Archetype archetype,
+                                                 List<Topic> topics) {
+        String normalizedFileName = fileName.toLowerCase(Locale.ROOT);
+        Topic best = topics.get(0);
+        int bestScore = Integer.MIN_VALUE;
+        for (Topic topic : topics) {
+            int score = 0;
+            for (String hint : topic.hints()) {
+                if (normalizedFileName.contains(hint)) {
+                    score += 100 + Math.min(20, hint.length());
+                }
+            }
+            if (topicMatchesArchetype(topic, archetype)) {
+                score += 30;
+            }
+            if (score > bestScore) {
+                best = topic;
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    private static boolean topicMatchesArchetype(Topic topic, Archetype archetype) {
+        String searchable = (topic.name() + " " + String.join(" ", topic.hints()))
+                .toLowerCase(Locale.ROOT);
+        return switch (archetype) {
+            case ENERGETIC -> containsAny(searchable, "energetic", "energy", "workout", "dance", "rave", "fast");
+            case CHILL -> containsAny(searchable, "chill", "lofi", "sleep", "calm", "relax", "acoustic");
+            case DARK -> containsAny(searchable, "dark", "doom", "shadow", "villain", "goth", "night");
+            case BRIGHT -> containsAny(searchable, "bright", "happy", "sun", "summer", "smile", "party");
+            case MELANCHOLIC -> containsAny(searchable, "melanchol", "sad", "cry", "lonely", "broken", "rain");
+            case ATMOSPHERIC -> containsAny(searchable, "atmos", "ambient", "dream", "space", "ethereal", "cinematic");
+        };
+    }
+
+    private Optional<Topic> classifyWithLocalModel(String fileName, AudioFeatures features,
+                                                   List<Topic> topics) {
         try {
             HttpRequest tagsRequest = HttpRequest.newBuilder(OLLAMA_TAGS)
                     .timeout(Duration.ofMillis(900)).GET().build();
@@ -226,8 +284,12 @@ public final class MusicVibeSorter {
             if (model.isEmpty()) {
                 return Optional.empty();
             }
-            String prompt = "Classify this music into exactly one label: Energetic, Chill, Dark, Bright, "
-                    + "Melancholic, Atmospheric. Reply with the label only. Filename: " + fileName
+            String topicChoices = topics.stream()
+                    .map(topic -> topic.name() + (topic.hints().isEmpty() ? ""
+                            : " (" + String.join(", ", topic.hints()) + ")"))
+                    .reduce((left, right) -> left + "; " + right).orElseThrow();
+            String prompt = "Classify this music into exactly one of these user-defined topics: "
+                    + topicChoices + ". Reply with the topic name only. Filename: " + fileName
                     + ". Features: BPM=" + rounded(features.bpm())
                     + ", energy=" + rounded(features.energy())
                     + ", brightness=" + rounded(features.brightness())
@@ -245,9 +307,16 @@ public final class MusicVibeSorter {
             if (response.statusCode() / 100 != 2) {
                 return Optional.empty();
             }
-            String normalized = response.body().toLowerCase(Locale.ROOT);
-            return VIBES.stream().filter(vibe -> normalized.contains(vibe.displayName().toLowerCase(Locale.ROOT)))
-                    .findFirst();
+            Matcher responseMatcher = OLLAMA_RESPONSE.matcher(response.body());
+            if (!responseMatcher.find()) {
+                return Optional.empty();
+            }
+            String answer = responseMatcher.group(1).replace("\\\"", "\"")
+                    .replace("\\n", " ").trim();
+            return topics.stream()
+                    .filter(topic -> answer.equalsIgnoreCase(topic.name())
+                            || answer.toLowerCase(Locale.ROOT).contains(topic.name().toLowerCase(Locale.ROOT)))
+                    .max(Comparator.comparingInt(topic -> topic.name().length()));
         } catch (IOException | InterruptedException | RuntimeException unavailable) {
             if (unavailable instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
@@ -267,6 +336,25 @@ public final class MusicVibeSorter {
             }
         }
         return models.stream().min(Comparator.comparingInt(String::length));
+    }
+
+    private static List<Topic> normalizeTopics(List<Topic> topics) {
+        if (topics == null || topics.isEmpty()) {
+            throw new IllegalArgumentException("MVSS requires at least one topic");
+        }
+        if (topics.size() > 32) {
+            throw new IllegalArgumentException("MVSS supports at most 32 topics");
+        }
+        List<Topic> normalized = new ArrayList<>(topics.size());
+        Set<String> names = new HashSet<>();
+        for (Topic topic : topics) {
+            Topic checked = new Topic(topic.name(), topic.hints());
+            if (!names.add(checked.name().toLowerCase(Locale.ROOT))) {
+                throw new IllegalArgumentException("Duplicate MVSS topic: " + checked.name());
+            }
+            normalized.add(checked);
+        }
+        return List.copyOf(normalized);
     }
 
     private static Path requireSortableFile(Path audioFile, Path audioLibrary) throws IOException {
@@ -339,26 +427,29 @@ public final class MusicVibeSorter {
                              AudioFeatures features, String classifier) {
     }
 
-    private enum Vibe {
-        ENERGETIC("Energetic"),
-        CHILL("Chill"),
-        DARK("Dark"),
-        BRIGHT("Bright"),
-        MELANCHOLIC("Melancholic"),
-        ATMOSPHERIC("Atmospheric");
-
-        private final String displayName;
-
-        Vibe(String displayName) {
-            this.displayName = displayName;
-        }
-
-        String displayName() {
-            return displayName;
-        }
-
-        String directoryName() {
-            return displayName;
+    public record Topic(String name, List<String> hints) {
+        public Topic {
+            name = name == null ? "" : name.trim();
+            if (name.isEmpty() || name.length() > 48 || name.equals(".") || name.equals("..")
+                    || name.matches(".*[<>:\"/\\\\|?*\\p{Cntrl}].*")) {
+                throw new IllegalArgumentException("Invalid MVSS topic name: " + name);
+            }
+            List<String> normalizedHints = new ArrayList<>();
+            if (hints != null) {
+                for (String hint : hints) {
+                    String normalized = hint == null ? "" : hint.trim().toLowerCase(Locale.ROOT);
+                    if (!normalized.isEmpty() && normalized.length() <= 40
+                            && !normalizedHints.contains(normalized)) {
+                        normalizedHints.add(normalized);
+                    }
+                }
+            }
+            if (normalizedHints.size() > 24) {
+                throw new IllegalArgumentException("MVSS topic " + name + " has more than 24 hints");
+            }
+            hints = List.copyOf(normalizedHints);
         }
     }
+
+    private enum Archetype { ENERGETIC, CHILL, DARK, BRIGHT, MELANCHOLIC, ATMOSPHERIC }
 }
