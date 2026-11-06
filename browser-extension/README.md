@@ -5,7 +5,7 @@ Manifest V3 extension for Chromium-based browsers. It adds:
 - `AUDIO` and `VIDEO` controls beside YouTube's Subscribe control.
 - A compact glitch download icon on YouTube video thumbnails.
 - Detail-page Audio/Video controls and thumbnail actions on Rule34.
-- Generic Audio/Video controls under standard HTML media players on other sites.
+- Layout-neutral Audio/Video overlay controls on standard HTML media players on other sites.
 - A compact download action on large linked thumbnails across other HTTP/HTTPS sites.
 - Stable Rule34 filenames using `Rule34_<post-id>.<extension>`.
 - A cyberpunk top-right notification with startup, progress, completion, and failure states.
@@ -25,6 +25,8 @@ The extension has a fixed development ID so the native-host permission remains s
 
 ## Generic site detection
 
-yt-dlp extractors cover many unrelated website designs, so there is no universal thumbnail element. Outside the specialized YouTube and Rule34 integrations, iNTAKE detects standard `<video>`/`<audio>` players and sufficiently large images inside links. The linked page URL is sent to yt-dlp, which performs the final support check. Custom canvas players, closed shadow DOM, and unusual thumbnail markup may not expose an injectable element.
+yt-dlp extractors cover many unrelated website designs, so there is no universal thumbnail element. Outside the specialized YouTube and Rule34 integrations, iNTAKE detects standard `<video>`/`<audio>` players and sufficiently large images inside links. Generic controls render in an isolated viewport overlay and never change the host site's media wrappers, dimensions, positioning, or child layout. The linked page URL is sent to yt-dlp, which performs the final support check. Custom canvas players, closed shadow DOM, and unusual thumbnail markup may not expose an injectable element.
+
+Facebook and Messenger use continuously recycled, lazy-loaded image containers. To avoid interfering with those render pipelines, iNTAKE does not scan their ordinary `<img>` thumbnails. Controls remain available on actual HTML video and audio players, and supported post/page URLs can still be pasted into the desktop application.
 
 YouTube is a single-page application; the content script watches navigation and dynamically inserted recommendations, so buttons remain available without reloading the tab.

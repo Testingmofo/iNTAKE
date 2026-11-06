@@ -10,9 +10,18 @@ $stagingDirectory = Join-Path $projectRoot '.release-build'
 $packageInput = Join-Path $stagingDirectory 'input'
 $imageDirectory = Join-Path $stagingDirectory 'image'
 $applicationImage = Join-Path $imageDirectory 'iNTAKE'
-$version = '0.1.0'
-$releaseLabel = '0.1.0-beta'
-$extensionVersion = '1.3.0'
+$version = '0.2.0'
+$releaseLabel = '0.2.0-beta'
+$pomPath = Join-Path $projectRoot 'pom.xml'
+[xml]$pomDocument = Get-Content -LiteralPath $pomPath -Raw
+$mavenArtifactVersion = [string]$pomDocument.project.version
+$applicationJarName = "intake-$mavenArtifactVersion.jar"
+$extensionManifestPath = Join-Path $projectRoot 'browser-extension\manifest.json'
+$extensionManifest = Get-Content -LiteralPath $extensionManifestPath -Raw | ConvertFrom-Json
+$extensionVersion = [string]$extensionManifest.version
+if ($extensionVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Invalid browser extension version in ${extensionManifestPath}: $extensionVersion"
+}
 $upgradeUuid = '06f5b964-26a8-4eeb-91c4-df18a7e6dde2'
 
 function Assert-ProjectChild {
@@ -113,7 +122,7 @@ Invoke-Checked $maven @(
     '-DoutputDirectory=target/release-dependencies'
 )
 
-Copy-Item -LiteralPath (Join-Path $projectRoot 'target\intake-1.0.0.jar') -Destination $packageInput
+Copy-Item -LiteralPath (Join-Path $projectRoot "target\$applicationJarName") -Destination $packageInput
 Get-ChildItem -LiteralPath (Join-Path $projectRoot 'target\release-dependencies') -Filter '*.jar' -File |
     Copy-Item -Destination $packageInput
 Copy-Item -LiteralPath (Join-Path $projectRoot 'release\THIRD-PARTY-NOTICES.txt') -Destination $packageInput
@@ -137,12 +146,12 @@ Invoke-Checked $jpackage @(
     '--dest', $imageDirectory,
     '--input', $packageInput,
     '--name', 'iNTAKE',
-    '--main-jar', 'intake-1.0.0.jar',
+    '--main-jar', $applicationJarName,
     '--main-class', 'IntakeLauncher',
     '--app-version', $version,
     '--vendor', 'iNSRT',
     '--description', 'iNTAKE Media NetCrawler',
-    '--add-modules', 'java.desktop,jdk.httpserver,jdk.unsupported,java.logging,java.xml,jdk.crypto.ec',
+    '--add-modules', 'java.desktop,java.net.http,jdk.httpserver,jdk.unsupported,java.logging,java.xml,jdk.crypto.ec',
     '--java-options', '-Dfile.encoding=UTF-8'
 )
 
