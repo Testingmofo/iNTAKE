@@ -45,6 +45,12 @@ The unpacked extension is located in `browser-extension`. Release builds also pr
 
 The extension communicates with the local iNTAKE application. If iNTAKE is offline, its native-messaging helper starts the application silently before forwarding the download request.
 
+## YouTube access challenges
+
+YouTube may temporarily rate-limit an IP address or require a signed-in browser session. In the configuration matrix, **YouTube Session // Cookies from Browser** can be set to Firefox, Chrome, Edge, Brave, Vivaldi, or Opera. The setting is off by default and is applied only to YouTube requests. iNTAKE stores only the selected browser name; yt-dlp reads the browser session at execution time.
+
+Before enabling it, open the affected video in that browser and complete any CAPTCHA or sign-in challenge. Account-backed downloading can result in temporary or permanent YouTube account restrictions, so use it only when necessary and never share exported cookies or session data. iNTAKE also applies a one-second delay between YouTube metadata requests to reduce avoidable request bursts.
+
 ## MVSS automatic audio sorting
 
 Enable **Auto Sort via MVSS** in the main control bar to analyze completed audio downloads locally. MVSS decodes a short sample through FFmpeg, measures tempo, energy, brightness, zero-crossing activity, and dynamics, then moves the file into:
@@ -53,9 +59,15 @@ Enable **Auto Sort via MVSS** in the main control bar to analyze completed audio
 <Audio download location>\MVSS\<Vibe>\
 ```
 
-Vibe folders include `Energetic`, `Chill`, `Dark`, `Bright`, `Melancholic`, and `Atmospheric`. Existing files are never overwritten; MVSS adds a numeric suffix when necessary.
+The configuration matrix contains an **MVSS Audio Themes // Topics** editor. Define one destination topic per line using:
 
-The acoustic classifier works fully offline. If Ollama is already running with a small local model (up to roughly 3B parameters), MVSS uses it as an optional constrained refinement step. Ollama is not required.
+```text
+Topic name | keyword, keyword, mood hint
+```
+
+For example, `Boss Music | boss, battle, intense, game` creates an `MVSS\Boss Music` folder and gives the offline classifier matching hints. Topic names and hints persist in `intake.properties`. The default topics remain `Energetic`, `Chill`, `Dark`, `Bright`, `Melancholic`, and `Atmospheric`, and existing files are never overwritten; MVSS adds a numeric suffix when necessary.
+
+The acoustic classifier works fully offline by combining measured audio features with configured topic hints. If Ollama is already running with a small local model (up to roughly 3B parameters), MVSS asks it to choose only from the configured topic list as an optional refinement step. Ollama is not required.
 
 ## Cyberpunk theme customization
 
