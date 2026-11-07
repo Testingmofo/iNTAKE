@@ -10,8 +10,8 @@ $stagingDirectory = Join-Path $projectRoot '.release-build'
 $packageInput = Join-Path $stagingDirectory 'input'
 $imageDirectory = Join-Path $stagingDirectory 'image'
 $applicationImage = Join-Path $imageDirectory 'iNTAKE'
-$version = '0.2.1'
-$releaseLabel = '0.2.1-beta'
+$version = '0.2.2'
+$releaseLabel = '0.2.2-beta'
 $pomPath = Join-Path $projectRoot 'pom.xml'
 [xml]$pomDocument = Get-Content -LiteralPath $pomPath -Raw
 $mavenArtifactVersion = [string]$pomDocument.project.version
@@ -126,6 +126,8 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "target\$applicationJarName") -De
 Get-ChildItem -LiteralPath (Join-Path $projectRoot 'target\release-dependencies') -Filter '*.jar' -File |
     Copy-Item -Destination $packageInput
 Copy-Item -LiteralPath (Join-Path $projectRoot 'release\THIRD-PARTY-NOTICES.txt') -Destination $packageInput
+Copy-Item -LiteralPath (Join-Path $projectRoot 'browser-extension') `
+    -Destination (Join-Path $packageInput 'browser-extension') -Recurse
 
 $toolsDirectory = Join-Path $packageInput 'tools'
 [void](New-Item -ItemType Directory -Path $toolsDirectory -Force)
@@ -163,6 +165,7 @@ Invoke-Checked $jpackage @(
     '--description', 'iNTAKE Media NetCrawler',
     '--add-modules', 'java.desktop,java.net.http,jdk.httpserver,jdk.unsupported,java.logging,java.xml,jdk.crypto.ec',
     '--java-options', '-Dfile.encoding=UTF-8'
+    '--java-options', "-Dintake.version=$releaseLabel"
     '--add-launcher', "Uninstall iNTAKE=$uninstallLauncherProperties"
 )
 

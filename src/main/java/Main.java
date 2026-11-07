@@ -100,6 +100,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -182,6 +183,7 @@ public final class Main extends Application {
     private final AtomicBoolean initialCommandsSubmitted = new AtomicBoolean(false);
     private final CountDownLatch updateFinished = new CountDownLatch(1);
     private final ReentrantLock pauseLock = new ReentrantLock();
+    private final ReentrantLock operaGxCookieLock = new ReentrantLock();
     private final Condition unpaused = pauseLock.newCondition();
     private final Object failureFileLock = new Object();
     private final Object historyFileLock = new Object();
@@ -198,6 +200,8 @@ public final class Main extends Application {
     private final ExecutorService mvssWorker = Executors.newSingleThreadExecutor(
             daemonThreadFactory("intake-mvss"));
     private final MusicVibeSorter musicVibeSorter = new MusicVibeSorter(resolveFfmpegExecutable());
+    private final ApplicationUpdater applicationUpdater = new ApplicationUpdater(
+            APPLICATION_DATA_DIRECTORY);
 
     private volatile boolean silentLaunch;
     private volatile boolean extensionLaunch;
@@ -206,6 +210,7 @@ public final class Main extends Application {
 
     private Stage primaryStage;
     private Stage settingsStage;
+    private Stage updateStage;
     private TranslateTransition marqueeAnimation;
     private TableView<DownloadItem> downloadTable;
     private TextFlow logFlow;
@@ -218,6 +223,7 @@ public final class Main extends Application {
     private final Path settingsFile = APPLICATION_DATA_DIRECTORY.resolve("intake.properties");
     private final Path historyFile = APPLICATION_DATA_DIRECTORY.resolve("download-history.tsv");
     private volatile AppSettings appSettings = AppSettings.defaults();
+    private volatile ApplicationUpdater.ExtensionSyncResult extensionSyncResult;
     private double windowDragOffsetX;
     private double windowDragOffsetY;
     private boolean windowDragArmed;
@@ -245,6 +251,7 @@ public final class Main extends Application {
         stage.initStyle(StageStyle.TRANSPARENT);
         loadDownloadHistory();
         initializeUI(stage);
+        syncManagedBrowserExtension();
         registerPackagedNativeMessagingHost();
         boolean trayReady = installSystemTray();
         startExtensionBridge();
@@ -267,6 +274,9 @@ public final class Main extends Application {
             showMainWindow();
         } else {
             appendLog("Started hidden in the system tray.", LogKind.SYSTEM);
+        }
+        if (!silentLaunch && isPackagedApplication()) {
+            background.execute(this::checkForApplicationUpdate);
         }
         evaluateExtensionExit();
     }
@@ -625,13 +635,27 @@ public final class Main extends Application {
         youtubeCookies.setStyle("-fx-background-color: #080a0f; -fx-border-color: " + CYAN
                 + "; -fx-border-width: 1; -fx-background-radius: 0; -fx-border-radius: 0;"
                 + " -fx-font-family: 'Monospaced';");
-        Label cookieWarning = new Label(
-                "OFF BY DEFAULT // Uses your selected browser session only for YouTube requests. "
-                        + "Sign in and complete any CAPTCHA in that browser first. Account use carries "
-                        + "a temporary or permanent YouTube restriction risk.");
+        Label cookieWarning = new Label();
         cookieWarning.setWrapText(true);
-        cookieWarning.setTextFill(Color.web("#8ca3b8"));
         cookieWarning.setFont(Font.font("Monospaced", 10));
+        Runnable refreshCookieWarning = () -> {
+            if (youtubeCookies.getValue() == CookieBrowser.OPERA_GX) {
+                cookieWarning.setText(
+                        "OPERA GX WARNING // Not completely supported by yt-dlp. Saving this option "
+                                + "authorizes iNTAKE to close Opera GX before an authenticated YouTube "
+                                + "download and reopen it afterward. Remaining background processes may be "
+                                + "ended after a graceful-close timeout. Save forms and browser work first.");
+                cookieWarning.setTextFill(Color.web(MAGENTA));
+            } else {
+                cookieWarning.setText(
+                        "OFF BY DEFAULT // Uses your selected browser session only for YouTube requests. "
+                                + "Sign in and complete any CAPTCHA in that browser first. Account use "
+                                + "carries a temporary or permanent YouTube restriction risk.");
+                cookieWarning.setTextFill(Color.web("#8ca3b8"));
+            }
+        };
+        youtubeCookies.setOnAction(event -> refreshCookieWarning.run());
+        refreshCookieWarning.run();
         VBox youtubeAccessBox = new VBox(6,
                 settingsSectionLabel("YOUTUBE SESSION // COOKIES FROM BROWSER", CYAN),
                 youtubeCookies, cookieWarning);
@@ -1167,6 +1191,12 @@ public final class Main extends Application {
     }
 
     private static Optional<Path> packagedToolsDirectory() {
+        return packagedAppDirectory()
+                .map(directory -> directory.resolve("tools"))
+                .filter(Files::isDirectory);
+    }
+
+    private static Optional<Path> packagedAppDirectory() {
         String applicationPath = System.getProperty("jpackage.app-path");
         if (applicationPath == null || applicationPath.isBlank()) {
             return Optional.empty();
@@ -1176,8 +1206,27 @@ public final class Main extends Application {
         if (imageRoot == null) {
             return Optional.empty();
         }
-        Path tools = imageRoot.resolve("app").resolve("tools");
-        return Files.isDirectory(tools) ? Optional.of(tools) : Optional.empty();
+        Path appDirectory = imageRoot.resolve("app");
+        return Files.isDirectory(appDirectory) ? Optional.of(appDirectory) : Optional.empty();
+    }
+
+    private void syncManagedBrowserExtension() {
+        Path source = packagedAppDirectory()
+                .map(directory -> directory.resolve("browser-extension"))
+                .orElse(Path.of("browser-extension").toAbsolutePath().normalize());
+        try {
+            ApplicationUpdater.ExtensionSyncResult result =
+                    applicationUpdater.syncManagedExtension(source);
+            extensionSyncResult = result;
+            if (result.updated()) {
+                appendLog("Browser extension " + result.version() + " staged at "
+                        + result.directory() + ". Load the unpacked extension from this managed "
+                        + "folder once to enable future automatic reloads.", LogKind.SUCCESS);
+            }
+        } catch (IOException failure) {
+            appendLog("Unable to synchronize the managed browser extension: "
+                    + failure.getMessage(), LogKind.WARNING);
+        }
     }
 
     private static String resolveYtDlpExecutable() {
@@ -1255,6 +1304,7 @@ public final class Main extends Application {
             HttpServer bridge = HttpServer.create(
                     new InetSocketAddress(InetAddress.getByName("127.0.0.1"), EXTENSION_BRIDGE_PORT), 0);
             bridge.createContext("/health", this::handleExtensionHealthRequest);
+            bridge.createContext("/extension-version", this::handleExtensionVersionRequest);
             bridge.createContext("/enqueue", this::handleExtensionEnqueueRequest);
             bridge.createContext("/status", this::handleExtensionStatusRequest);
             bridge.setExecutor(background);
@@ -1277,6 +1327,28 @@ public final class Main extends Application {
             return;
         }
         sendBridgeResponse(exchange, 200, "{\"ok\":true,\"service\":\"iNTAKE\"}");
+    }
+
+    private void handleExtensionVersionRequest(HttpExchange exchange) throws IOException {
+        addExtensionCorsHeaders(exchange);
+        if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendBridgeResponse(exchange, 204, "");
+            return;
+        }
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendBridgeResponse(exchange, 405, "{\"ok\":false,\"error\":\"Method not allowed\"}");
+            return;
+        }
+        String extensionMarker = exchange.getRequestHeaders().getFirst("X-iNTAKE-Extension");
+        if (!"1".equals(extensionMarker)) {
+            sendBridgeResponse(exchange, 403, "{\"ok\":false,\"error\":\"Untrusted request\"}");
+            return;
+        }
+        String version = applicationUpdater.managedExtensionVersion();
+        String directory = applicationUpdater.managedExtensionDirectory().toString();
+        sendBridgeResponse(exchange, 200, "{\"ok\":true,\"version\":\""
+                + jsonEscape(version) + "\",\"managedPath\":\""
+                + jsonEscape(directory) + "\"}");
     }
 
     private void handleExtensionEnqueueRequest(HttpExchange exchange) throws IOException {
@@ -1849,6 +1921,11 @@ public final class Main extends Application {
         runOnFx(() -> item.setStatus(DownloadStatus.DOWNLOADING));
         boolean completionDeferred = false;
         Path finalPathReport = null;
+        AppSettings settingsSnapshot = appSettings;
+        boolean youtubeRequest = isYouTubeRequest(command.arguments());
+        boolean operaGxLockHeld = false;
+        OperaGxSession operaGxSession = OperaGxSession.inactive();
+        AtomicBoolean operaGxReopened = new AtomicBoolean(false);
 
         List<String> processArguments = new ArrayList<>();
         processArguments.add(resolveYtDlpExecutable());
@@ -1858,8 +1935,6 @@ public final class Main extends Application {
         processArguments.add("utf-8");
 
         try {
-            AppSettings settingsSnapshot = appSettings;
-            boolean youtubeRequest = isYouTubeRequest(command.arguments());
             if (youtubeRequest) {
                 // A small metadata-request delay reduces the chance of escalating a
                 // temporary YouTube rate limit. It does not attempt to bypass one.
@@ -1867,8 +1942,14 @@ public final class Main extends Application {
                 processArguments.add("1");
                 CookieBrowser browser = settingsSnapshot.youtubeCookieBrowser();
                 if (browser != CookieBrowser.OFF) {
+                    if (browser == CookieBrowser.OPERA_GX) {
+                        operaGxCookieLock.lockInterruptibly();
+                        operaGxLockHeld = true;
+                        operaGxSession = detectOperaGxSession();
+                        closeOperaGxForCookieAccess(operaGxSession);
+                    }
                     processArguments.add("--cookies-from-browser");
-                    processArguments.add(browser.cliName());
+                    processArguments.add(browser.ytDlpArgument());
                     appendLog("YouTube session enabled from " + browser.displayName()
                             + ". Browser cookies remain managed by yt-dlp.", LogKind.SYSTEM);
                 }
@@ -1881,7 +1962,15 @@ public final class Main extends Application {
             processArguments.add(finalPathReport.toString());
             processArguments.addAll(command.arguments());
 
-            ProcessAttempt attempt = runDownloadAttempt(processArguments, item, "YT-DLP");
+            OperaGxSession activeOperaGxSession = operaGxSession;
+            Runnable reopenOperaGxAfterTransferStarts = activeOperaGxSession.wasRunning()
+                    ? () -> {
+                        if (operaGxReopened.compareAndSet(false, true)) {
+                            reopenOperaGx(activeOperaGxSession);
+                        }
+                    } : null;
+            ProcessAttempt attempt = runDownloadAttempt(processArguments, item, "YT-DLP",
+                    reopenOperaGxAfterTransferStarts);
             StringBuilder completeOutput = new StringBuilder(attempt.output());
 
             if (attempt.exitCode() != 0 && requiresGenericImpersonation(attempt.output())
@@ -1892,7 +1981,8 @@ public final class Main extends Application {
                 retryArguments.add(3, "--extractor-args");
                 retryArguments.add(4, "generic:impersonate");
 
-                ProcessAttempt retry = runDownloadAttempt(retryArguments, item, "YT-DLP RETRY");
+                ProcessAttempt retry = runDownloadAttempt(retryArguments, item, "YT-DLP RETRY",
+                        reopenOperaGxAfterTransferStarts);
                 completeOutput.append(System.lineSeparator())
                         .append("=== GENERIC IMPERSONATION RETRY ===")
                         .append(System.lineSeparator())
@@ -1927,6 +2017,13 @@ public final class Main extends Application {
         } catch (Throwable failure) {
             reportFailure("Download failed", unwrapCompletionFailure(failure), item);
         } finally {
+            if (operaGxSession.wasRunning() && !operaGxSession.hasAliveProcesses()
+                    && operaGxReopened.compareAndSet(false, true)) {
+                reopenOperaGx(operaGxSession);
+            }
+            if (operaGxLockHeld) {
+                operaGxCookieLock.unlock();
+            }
             if (finalPathReport != null) {
                 try {
                     Files.deleteIfExists(finalPathReport);
@@ -1939,6 +2036,116 @@ public final class Main extends Application {
             if (!completionDeferred) {
                 finishOutstandingDownload();
             }
+        }
+    }
+
+    private OperaGxSession detectOperaGxSession() throws IOException, InterruptedException {
+        Path executable = locateOperaGxExecutable();
+        List<ProcessHandle> processes = ProcessHandle.allProcesses()
+                .filter(ProcessHandle::isAlive)
+                .filter(process -> process.info().command()
+                        .map(command -> command.toLowerCase(Locale.ROOT).contains("opera gx")
+                                && command.toLowerCase(Locale.ROOT).endsWith("opera.exe"))
+                        .orElse(false))
+                .toList();
+        if (processes.isEmpty() && executable != null) {
+            Process query = new ProcessBuilder("powershell.exe", "-NoLogo", "-NoProfile",
+                    "-NonInteractive", "-Command",
+                    "Get-Process -Name opera -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }")
+                    .redirectErrorStream(true)
+                    .start();
+            List<Long> processIds = new ArrayList<>();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    query.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    try {
+                        processIds.add(Long.parseLong(line.trim()));
+                    } catch (NumberFormatException ignored) {
+                        // PowerShell may emit a non-numeric warning; it is not a process ID.
+                    }
+                }
+            }
+            if (query.waitFor() != 0) {
+                throw new IOException("Windows could not inspect Opera GX processes");
+            }
+            if (!processIds.isEmpty()) {
+                return new OperaGxSession(executable, processIds);
+            }
+        }
+        if (processes.isEmpty()) {
+            return OperaGxSession.inactive();
+        }
+        Path detectedExecutable = processes.stream()
+                .map(process -> process.info().command())
+                .flatMap(Optional::stream)
+                .map(Path::of)
+                .findFirst()
+                .orElse(executable);
+        return detectedExecutable == null ? OperaGxSession.inactive()
+                : new OperaGxSession(detectedExecutable,
+                processes.stream().map(ProcessHandle::pid).toList());
+    }
+
+    private static Path locateOperaGxExecutable() {
+        List<Path> candidates = new ArrayList<>();
+        String localData = System.getenv("LOCALAPPDATA");
+        if (localData != null && !localData.isBlank()) {
+            candidates.add(Path.of(localData, "Programs", "Opera GX", "opera.exe"));
+        }
+        candidates.add(Path.of("C:\\Program Files\\Opera GX\\opera.exe"));
+        candidates.add(Path.of("C:\\Program Files (x86)\\Opera GX\\opera.exe"));
+        return candidates.stream().map(path -> path.toAbsolutePath().normalize())
+                .filter(Files::isRegularFile).findFirst().orElse(null);
+    }
+
+    private void closeOperaGxForCookieAccess(OperaGxSession session)
+            throws IOException, InterruptedException {
+        if (!session.wasRunning()) {
+            appendLog("Opera GX is already closed; reading its cookie profile directly.", LogKind.SYSTEM);
+            return;
+        }
+        appendLog("Opera GX cookie mode armed. Requesting a graceful browser shutdown...",
+                LogKind.WARNING);
+        String closeScript = "$targets = Get-Process -Name opera -ErrorAction SilentlyContinue | "
+                + "Where-Object { $_.Path -like '*\\Opera GX\\*' }; "
+                + "$windows = @($targets | Where-Object { $_.MainWindowHandle -ne 0 }); "
+                + "foreach ($process in $windows) { $null = $process.CloseMainWindow() }";
+        Process closeRequest = new ProcessBuilder("powershell.exe", "-NoLogo", "-NoProfile",
+                "-NonInteractive", "-WindowStyle", "Hidden", "-Command", closeScript)
+                .redirectErrorStream(true)
+                .start();
+        if (closeRequest.waitFor() != 0) {
+            throw new IOException("Windows could not request Opera GX to close");
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(7);
+        while (session.hasAliveProcesses() && System.nanoTime() < deadline) {
+            Thread.sleep(150);
+        }
+        if (session.hasAliveProcesses()) {
+            appendLog("Opera GX left background processes running; ending them to unlock cookies.",
+                    LogKind.WARNING);
+            session.destroyRemainingProcesses();
+            long forceDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(4);
+            while (session.hasAliveProcesses() && System.nanoTime() < forceDeadline) {
+                Thread.sleep(100);
+            }
+            if (session.hasAliveProcesses()) {
+                throw new IOException("Opera GX could not be closed. Close it manually, including "
+                        + "background processes, then retry.");
+            }
+        }
+        appendLog("Opera GX closed. yt-dlp can now access the unlocked cookie database.",
+                LogKind.SYSTEM);
+    }
+
+    private void reopenOperaGx(OperaGxSession session) {
+        try {
+            new ProcessBuilder(session.executable().toString(), "--restore-last-session").start();
+            appendLog("Opera GX reopened after the authenticated download attempt.", LogKind.SUCCESS);
+        } catch (IOException failure) {
+            appendLog("Unable to reopen Opera GX automatically: " + failure.getMessage()
+                    + ". Start it manually to restore the previous session.", LogKind.WARNING);
         }
     }
 
@@ -2022,7 +2229,8 @@ public final class Main extends Application {
     }
 
     private ProcessAttempt runDownloadAttempt(List<String> processArguments, DownloadItem item,
-                                              String logSource) throws IOException, InterruptedException {
+                                              String logSource, Runnable transferStarted)
+            throws IOException, InterruptedException {
         appendLog("Executing: " + printableCommand(processArguments), LogKind.SYSTEM);
         ProcessBuilder builder = createToolProcessBuilder(processArguments)
                 .redirectErrorStream(true);
@@ -2031,7 +2239,8 @@ public final class Main extends Application {
         try {
             StringBuilder output = new StringBuilder(8_192);
             CompletableFuture<Void> outputReader = CompletableFuture.runAsync(
-                    () -> readProcessOutput(process, item, output, true, logSource), background);
+                    () -> readProcessOutput(process, item, output, true, logSource, transferStarted),
+                    background);
             int exitCode = process.waitFor();
             outputReader.join();
             return new ProcessAttempt(exitCode, output.toString());
@@ -2071,6 +2280,12 @@ public final class Main extends Application {
 
     private void readProcessOutput(Process process, DownloadItem item, StringBuilder capture,
                                    boolean respectPause, String source) {
+        readProcessOutput(process, item, capture, respectPause, source, null);
+    }
+
+    private void readProcessOutput(Process process, DownloadItem item, StringBuilder capture,
+                                   boolean respectPause, String source, Runnable transferStarted) {
+        boolean transferCallbackInvoked = false;
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(
                 process.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
@@ -2082,6 +2297,13 @@ public final class Main extends Application {
                     capture.append(line).append(System.lineSeparator());
                 }
                 appendLog("[" + source + "] " + line, line.contains("ERROR:") ? LogKind.ERROR : LogKind.NORMAL);
+                if (!transferCallbackInvoked && transferStarted != null
+                        && (DESTINATION_PATTERN.matcher(line).matches()
+                        || PROGRESS_PATTERN.matcher(line).matches()
+                        || ALREADY_DOWNLOADED_PATTERN.matcher(line).matches())) {
+                    transferCallbackInvoked = true;
+                    transferStarted.run();
+                }
                 if (item != null) {
                     parseDownloadOutput(line, item);
                 }
@@ -2124,6 +2346,114 @@ public final class Main extends Application {
                 item.setFileLocation(path.toString());
             });
         });
+    }
+
+    private void checkForApplicationUpdate() {
+        try {
+            appendLog("Checking GitHub for iNTAKE beta updates...", LogKind.SYSTEM);
+            Optional<ApplicationUpdater.ReleaseInfo> release =
+                    applicationUpdater.findNewerBetaRelease();
+            if (release.isPresent()) {
+                appendLog("iNTAKE " + release.get().version() + " is available.", LogKind.SUCCESS);
+                runOnFx(() -> showApplicationUpdatePrompt(release.get()));
+            } else {
+                appendLog("iNTAKE " + ApplicationUpdater.currentVersion()
+                        + " is the newest beta release.", LogKind.SYSTEM);
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (IOException | RuntimeException failure) {
+            appendLog("Application update check unavailable: " + failure.getMessage(),
+                    LogKind.WARNING);
+        }
+    }
+
+    private void showApplicationUpdatePrompt(ApplicationUpdater.ReleaseInfo release) {
+        if (shuttingDown.get()) {
+            return;
+        }
+        if (updateStage != null) {
+            updateStage.toFront();
+            return;
+        }
+        Label heading = settingsSectionLabel("// iNTAKE UPDATE SIGNAL", CYAN);
+        Label versions = new Label("CURRENT  // " + ApplicationUpdater.currentVersion()
+                + System.lineSeparator() + "AVAILABLE // " + release.version());
+        versions.setTextFill(Color.web(TEXT));
+        versions.setFont(Font.font("Monospaced", FontWeight.BOLD, 13));
+        Label status = new Label(
+                "The installer and SHA256SUMS.txt will be downloaded from the official GitHub "
+                        + "release. Installation starts only after the SHA-256 hash matches.");
+        status.setWrapText(true);
+        status.setTextFill(Color.web("#8ca3b8"));
+        status.setFont(Font.font("Monospaced", 11));
+
+        Button later = new Button("LATER");
+        later.setStyle(warningButtonStyle());
+        Button install = new Button("VERIFY + UPDATE");
+        install.setStyle(primaryButtonStyle());
+        later.setOnAction(event -> updateStage.close());
+        install.setOnAction(event -> {
+            if (outstandingDownloads.get() > 0 || !commandQueue.isEmpty()) {
+                status.setText("UPDATE WAITING // Finish or clear the active download queue first.");
+                status.setTextFill(Color.web(MAGENTA));
+                return;
+            }
+            install.setDisable(true);
+            later.setDisable(true);
+            status.setText("DOWNLOADING // Watch the main log console for verification status.");
+            status.setTextFill(Color.web(CYAN));
+            background.execute(() -> downloadAndLaunchApplicationUpdate(release));
+        });
+        HBox controls = new HBox(10, later, install);
+        controls.setAlignment(Pos.CENTER_RIGHT);
+        VBox content = new VBox(14, heading, versions, status, controls);
+        content.setPadding(new Insets(18));
+        content.setStyle("-fx-background-color: " + PANEL + "; -fx-border-color: "
+                + CYAN + "; -fx-border-width: 1; -fx-font-family: 'Monospaced';");
+
+        updateStage = new Stage(StageStyle.TRANSPARENT);
+        updateStage.initOwner(primaryStage);
+        updateStage.initModality(Modality.WINDOW_MODAL);
+        updateStage.setTitle("iNTAKE // Update Available");
+        updateStage.setScene(new Scene(content, 560, 245, Color.TRANSPARENT));
+        updateStage.setOnHidden(event -> updateStage = null);
+        updateStage.show();
+    }
+
+    private void downloadAndLaunchApplicationUpdate(ApplicationUpdater.ReleaseInfo release) {
+        try {
+            ApplicationUpdater.StagedUpdate staged = applicationUpdater.downloadAndVerify(
+                    release, message -> appendLog("APP UPDATE // " + message, LogKind.SYSTEM));
+            Path installDirectory = currentInstallDirectory()
+                    .orElseThrow(() -> new IOException("The current installation directory is unknown"));
+            applicationUpdater.launchDetachedUpdate(
+                    staged, installDirectory, ProcessHandle.current().pid());
+            runOnFx(() -> shutdownApplication(
+                    "Verified update " + release.version() + " handed to the installer"));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            appendLog("Application update download interrupted.", LogKind.WARNING);
+            runOnFx(() -> {
+                if (updateStage != null) updateStage.close();
+            });
+        } catch (IOException | RuntimeException failure) {
+            reportFailure("Application update failed before uninstall; the current installation "
+                    + "was not changed", failure, null);
+            runOnFx(() -> {
+                if (updateStage != null) updateStage.close();
+                showMainWindow();
+            });
+        }
+    }
+
+    private static Optional<Path> currentInstallDirectory() {
+        String applicationPath = System.getProperty("jpackage.app-path");
+        if (applicationPath == null || applicationPath.isBlank()) {
+            return Optional.empty();
+        }
+        Path parent = Path.of(applicationPath).toAbsolutePath().normalize().getParent();
+        return Optional.ofNullable(parent);
     }
 
     private void runUpdateCheck() {
@@ -2759,7 +3089,8 @@ public final class Main extends Application {
         EDGE("Microsoft Edge", "edge"),
         BRAVE("Brave", "brave"),
         VIVALDI("Vivaldi", "vivaldi"),
-        OPERA("Opera", "opera");
+        OPERA("Opera", "opera"),
+        OPERA_GX("Opera GX", "opera-gx");
 
         private final String displayName;
         private final String cliName;
@@ -2771,6 +3102,18 @@ public final class Main extends Application {
 
         String displayName() { return displayName; }
         String cliName() { return cliName; }
+
+        String ytDlpArgument() {
+            if (this != OPERA_GX) {
+                return cliName;
+            }
+            String roamingData = System.getenv("APPDATA");
+            Path profile = roamingData == null || roamingData.isBlank()
+                    ? Path.of(System.getProperty("user.home"), "AppData", "Roaming",
+                    "Opera Software", "Opera GX Stable")
+                    : Path.of(roamingData, "Opera Software", "Opera GX Stable");
+            return "opera:" + profile.toAbsolutePath().normalize();
+        }
 
         static CookieBrowser fromConfig(String value) {
             if (value != null) {
@@ -2895,6 +3238,31 @@ public final class Main extends Application {
     private record ProcessAttempt(int exitCode, String output) {
         private ProcessAttempt {
             Objects.requireNonNull(output);
+        }
+    }
+
+    private record OperaGxSession(Path executable, List<Long> processIds) {
+        private OperaGxSession {
+            processIds = List.copyOf(processIds);
+        }
+
+        private static OperaGxSession inactive() {
+            return new OperaGxSession(null, List.of());
+        }
+
+        private boolean wasRunning() {
+            return executable != null && !processIds.isEmpty();
+        }
+
+        private boolean hasAliveProcesses() {
+            return processIds.stream().map(ProcessHandle::of)
+                    .flatMap(Optional::stream).anyMatch(ProcessHandle::isAlive);
+        }
+
+        private void destroyRemainingProcesses() {
+            processIds.stream().map(ProcessHandle::of).flatMap(Optional::stream)
+                    .filter(ProcessHandle::isAlive)
+                    .forEach(ProcessHandle::destroyForcibly);
         }
     }
 

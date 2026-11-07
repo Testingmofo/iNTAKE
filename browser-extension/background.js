@@ -2,7 +2,9 @@
 
 const BRIDGE_ENDPOINT = "http://127.0.0.1:17845/enqueue";
 const STATUS_ENDPOINT = "http://127.0.0.1:17845/status";
+const EXTENSION_VERSION_ENDPOINT = "http://127.0.0.1:17845/extension-version";
 const NATIVE_HOST = "com.insrt.intake";
+const EXTENSION_UPDATE_ALARM = "intake-extension-update";
 
 function isSupportedMediaUrl(value) {
   try {
@@ -106,6 +108,68 @@ async function readDownloadStatus(jobId) {
   });
   return parseBridgeResponse(response);
 }
+
+function compareVersions(left, right) {
+  const a = String(left).split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const b = String(right).split(".").map((part) => Number.parseInt(part, 10) || 0);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const difference = (a[index] || 0) - (b[index] || 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+async function notifyActiveTab(notification) {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  for (const tab of tabs) {
+    if (!Number.isInteger(tab.id)) continue;
+    chrome.tabs.sendMessage(tab.id, {
+      type: "intake.notification",
+      notification
+    }, () => void chrome.runtime.lastError);
+  }
+}
+
+async function checkManagedExtensionUpdate() {
+  try {
+    const response = await fetch(EXTENSION_VERSION_ENDPOINT, {
+      method: "GET",
+      headers: bridgeHeaders(false),
+      cache: "no-store"
+    });
+    const managed = await parseBridgeResponse(response);
+    const runtimeVersion = chrome.runtime.getManifest().version;
+    if (!managed.version || compareVersions(managed.version, runtimeVersion) <= 0) return;
+
+    const diskResponse = await fetch(chrome.runtime.getURL("manifest.json"), { cache: "no-store" });
+    const diskManifest = await diskResponse.json();
+    if (compareVersions(diskManifest.version, runtimeVersion) > 0) {
+      chrome.runtime.reload();
+      return;
+    }
+    await notifyActiveTab({
+      state: "active",
+      title: "iNTAKE // EXTENSION UPDATE READY",
+      message: `Load the unpacked extension from ${managed.managedPath}, then future updates can reload automatically.`
+    });
+  } catch {
+    // The desktop app may be offline; the next alarm or browser start retries.
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(EXTENSION_UPDATE_ALARM, { periodInMinutes: 30 });
+  void checkManagedExtensionUpdate();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  chrome.alarms.create(EXTENSION_UPDATE_ALARM, { periodInMinutes: 30 });
+  void checkManagedExtensionUpdate();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === EXTENSION_UPDATE_ALARM) void checkManagedExtensionUpdate();
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "intake.enqueue") {

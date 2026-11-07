@@ -15,13 +15,19 @@ Every action is sent to the local iNTAKE queue at `127.0.0.1:17845`. If that bri
 
 ## Install in Chrome or Edge
 
-1. Double-click `Launch iNTAKE.cmd` once. This builds and registers the browser wake-up host.
+1. Start the installed iNTAKE application once. This stages the extension and registers the browser wake-up host.
 2. Open `chrome://extensions` or `edge://extensions`.
 3. Enable **Developer mode**.
 4. Select **Load unpacked**.
-5. Select this `browser-extension` directory. If it was already loaded, select **Reload**.
+5. Select `%LOCALAPPDATA%\iNTAKE\browser-extension`. If an older copy was loaded from a ZIP or source directory, remove that copy first.
 
-The extension has a fixed development ID so the native-host permission remains stable. Moving the project folder requires running `Launch iNTAKE.cmd` again to update the registered host path.
+For source development, run `Launch iNTAKE.cmd` and load this repository's `browser-extension` directory instead. The extension has a fixed development ID so the native-host permission remains stable. Moving the project folder requires running the launcher again to update the registered host path.
+
+## Managed updates
+
+Extension version 1.3.3 or newer asks the local iNTAKE bridge for the managed extension version every 30 minutes and on browser startup. When an application update has replaced the files in `%LOCALAPPDATA%\iNTAKE\browser-extension`, the service worker reloads the extension so the new scripts take effect. If the currently loaded extension comes from a different folder, it displays the managed directory that must be loaded once.
+
+Chrome and Edge intentionally restrict silent self-hosted extension installation outside their stores and enterprise policy. Consequently, iNTAKE can update the contents of its managed unpacked directory, but it cannot perform the initial **Load unpacked** action on the user's behalf.
 
 ## Generic site detection
 
