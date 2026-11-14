@@ -13,6 +13,7 @@ This repository contains the current JavaFX edition. The original PowerShell edi
 - Persistent Main/Accent/Highlight color customization with cyberpunk presets
 - Playlist ignore and selection controls
 - Download progress, history, logs, and error reports
+- Bounded, batched log rendering and coalesced progress updates for responsive high-volume queues
 - System-tray operation and silent browser-extension startup
 - Chrome and Edge browser extension with native messaging
 - SHA-256-verified application and managed-extension updates
@@ -82,6 +83,8 @@ Topic name | keyword, keyword, mood hint
 For example, `Boss Music | boss, battle, intense, game` creates an `MVSS\Boss Music` folder and gives the offline classifier matching hints. Topic names and hints persist in `intake.properties`. The default topics remain `Energetic`, `Chill`, `Dark`, `Bright`, `Melancholic`, and `Atmospheric`, and existing files are never overwritten; MVSS adds a numeric suffix when necessary.
 
 The acoustic classifier works fully offline by combining measured audio features with configured topic hints. If Ollama is already running with a small local model (up to roughly 3B parameters), MVSS asks it to choose only from the configured topic list as an optional refinement step. Ollama is not required.
+
+Before acoustic classification, MVSS checks the existing audio library for duplicates. Byte-identical tracks are verified with SHA-256, while renamed or differently encoded copies use conservative normalized-title matching. Meaningful version markers—including live, remix, acoustic, instrumental, slowed, cover, and remastered—remain distinct. A detected copy is given the **Duplicate** table status and moved safely to `<Audio download location>\MVSS\Duplicates`; it is not permanently deleted. The log records the evidence and the existing track it matched.
 
 ## Cyberpunk theme customization
 

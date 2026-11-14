@@ -5,6 +5,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.text.Normalizer;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,6 +15,8 @@ import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -39,6 +44,20 @@ public final class MusicVibeSorter {
     private static final Pattern MODEL_NAME = Pattern.compile("\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
     private static final Pattern OLLAMA_RESPONSE = Pattern.compile(
             "\\\"response\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"");
+    private static final Pattern MEDIA_ID_SUFFIX = Pattern.compile(
+            "(?i)\\s*\\[[a-z0-9_-]{11}]\\s*$");
+    private static final Pattern NUMBERED_COPY_SUFFIX = Pattern.compile("\\s*\\(\\d+\\)\\s*$");
+    private static final Pattern NON_TITLE_CHARACTER = Pattern.compile("[^\\p{L}\\p{N}]+");
+    private static final Set<String> TITLE_NOISE = Set.of(
+            "official", "audio", "video", "music", "lyric", "lyrics", "visualizer",
+            "youtube", "topic", "hd", "hq", "4k", "mv");
+    private static final Set<String> VERSION_MARKERS = Set.of(
+            "remix", "live", "acoustic", "instrumental", "slowed", "reverb", "sped",
+            "nightcore", "cover", "remaster", "remastered", "edit", "extended", "demo",
+            "karaoke", "version", "mix");
+    private static final Set<String> AUDIO_EXTENSIONS = Set.of(
+            "aac", "aiff", "alac", "ape", "flac", "m4a", "mp3", "ogg", "opus",
+            "oga", "mka", "mpc", "tta", "wav", "webm", "wma", "wv");
     private static final List<Topic> DEFAULT_TOPICS = List.of(
             new Topic("Energetic", List.of("energy", "workout", "dance", "hardstyle", "rave", "fast")),
             new Topic("Chill", List.of("chill", "lofi", "sleep", "calm", "relax", "acoustic")),
@@ -61,14 +80,27 @@ public final class MusicVibeSorter {
         return DEFAULT_TOPICS;
     }
 
-    public SortResult sort(Path audioFile, Path audioLibrary) throws IOException, InterruptedException {
+    public synchronized SortResult sort(Path audioFile, Path audioLibrary)
+            throws IOException, InterruptedException {
         return sort(audioFile, audioLibrary, DEFAULT_TOPICS);
     }
 
-    public SortResult sort(Path audioFile, Path audioLibrary, List<Topic> configuredTopics)
+    public synchronized SortResult sort(Path audioFile, Path audioLibrary,
+                                        List<Topic> configuredTopics)
             throws IOException, InterruptedException {
         Path source = requireSortableFile(audioFile, audioLibrary);
         List<Topic> topics = normalizeTopics(configuredTopics);
+        Path root = audioLibrary.toAbsolutePath().normalize();
+        Optional<DuplicateMatch> duplicate = findDuplicate(source, root);
+        if (duplicate.isPresent()) {
+            Path duplicateDirectory = root.resolve("MVSS").resolve("Duplicates");
+            Files.createDirectories(duplicateDirectory);
+            Path destination = uniqueDestination(duplicateDirectory.resolve(source.getFileName()));
+            move(source, destination);
+            return new SortResult(source, destination, "Duplicates", Optional.empty(),
+                    "MVSS duplicate detector", duplicate);
+        }
+
         AudioFeatures features = analyze(source);
         Archetype archetype = classifyArchetype(source.getFileName().toString(), features);
         Topic heuristic = classifyConfiguredTopic(
@@ -77,13 +109,163 @@ public final class MusicVibeSorter {
                 source.getFileName().toString(), features, topics);
         Topic selected = modelTopic.orElse(heuristic);
 
-        Path root = audioLibrary.toAbsolutePath().normalize();
         Path destinationDirectory = root.resolve("MVSS").resolve(selected.name());
         Files.createDirectories(destinationDirectory);
         Path destination = uniqueDestination(destinationDirectory.resolve(source.getFileName()));
         move(source, destination);
-        return new SortResult(source, destination, selected.name(), features,
-                modelTopic.isPresent() ? "Ollama local model" : "MVSS acoustic engine");
+        return new SortResult(source, destination, selected.name(), Optional.of(features),
+                modelTopic.isPresent() ? "Ollama local model" : "MVSS acoustic engine",
+                Optional.empty());
+    }
+
+    private static Optional<DuplicateMatch> findDuplicate(Path source, Path audioLibrary)
+            throws IOException {
+        Path duplicateDirectory = audioLibrary.resolve("MVSS").resolve("Duplicates")
+                .toAbsolutePath().normalize();
+        List<Path> candidates;
+        try (var paths = Files.walk(audioLibrary)) {
+            candidates = paths
+                    .filter(Files::isRegularFile)
+                    .map(path -> path.toAbsolutePath().normalize())
+                    .filter(path -> !path.equals(source))
+                    .filter(path -> !path.startsWith(duplicateDirectory))
+                    .filter(MusicVibeSorter::isAudioFile)
+                    .toList();
+        }
+
+        long sourceSize = Files.size(source);
+        String sourceHash = null;
+        for (Path candidate : candidates) {
+            if (Files.size(candidate) != sourceSize) {
+                continue;
+            }
+            if (sourceHash == null) {
+                sourceHash = sha256(source);
+            }
+            if (sourceHash.equals(sha256(candidate))) {
+                return Optional.of(new DuplicateMatch(candidate,
+                        "identical SHA-256 audio file"));
+            }
+        }
+
+        for (Path candidate : candidates) {
+            TitleMatch match = compareTrackTitles(source.getFileName().toString(),
+                    candidate.getFileName().toString());
+            if (match != TitleMatch.NONE) {
+                String evidence = match == TitleMatch.EXACT
+                        ? "matching normalized track title"
+                        : "highly similar normalized track title";
+                return Optional.of(new DuplicateMatch(candidate, evidence));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static boolean isAudioFile(Path path) {
+        String fileName = path.getFileName() == null ? "" : path.getFileName().toString();
+        int dot = fileName.lastIndexOf('.');
+        return dot >= 0 && AUDIO_EXTENSIONS.contains(fileName.substring(dot + 1)
+                .toLowerCase(Locale.ROOT));
+    }
+
+    static boolean titlesIndicateDuplicate(String left, String right) {
+        return compareTrackTitles(left, right) != TitleMatch.NONE;
+    }
+
+    private static TitleMatch compareTrackTitles(String left, String right) {
+        TitleSignature first = titleSignature(left);
+        TitleSignature second = titleSignature(right);
+        if (first.normalized().isBlank() || second.normalized().isBlank()
+                || !first.versionMarkers().equals(second.versionMarkers())) {
+            return TitleMatch.NONE;
+        }
+        if (first.normalized().equals(second.normalized())) {
+            return TitleMatch.EXACT;
+        }
+        int minimumLength = Math.min(first.normalized().length(), second.normalized().length());
+        if (minimumLength >= 16) {
+            int distance = editDistance(first.normalized(), second.normalized());
+            double similarity = 1.0 - distance
+                    / (double) Math.max(first.normalized().length(), second.normalized().length());
+            if (similarity >= 0.94) {
+                return TitleMatch.SIMILAR;
+            }
+        }
+        if (first.tokens().size() >= 4 && second.tokens().size() >= 4) {
+            Set<String> union = new HashSet<>(first.tokens());
+            union.addAll(second.tokens());
+            Set<String> intersection = new HashSet<>(first.tokens());
+            intersection.retainAll(second.tokens());
+            if (!union.isEmpty() && intersection.size() / (double) union.size() >= 0.90) {
+                return TitleMatch.SIMILAR;
+            }
+        }
+        return TitleMatch.NONE;
+    }
+
+    private static TitleSignature titleSignature(String fileName) {
+        String name = Objects.requireNonNullElse(fileName, "");
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) {
+            name = name.substring(0, dot);
+        }
+        name = Normalizer.normalize(name, Normalizer.Form.NFKC).toLowerCase(Locale.ROOT);
+        name = MEDIA_ID_SUFFIX.matcher(name).replaceFirst("");
+        name = NUMBERED_COPY_SUFFIX.matcher(name).replaceFirst("");
+        name = NON_TITLE_CHARACTER.matcher(name).replaceAll(" ").trim();
+
+        LinkedHashSet<String> normalizedTokens = new LinkedHashSet<>();
+        Set<String> versionMarkers = new HashSet<>();
+        for (String token : name.split("\\s+")) {
+            if (token.isBlank()) {
+                continue;
+            }
+            if (VERSION_MARKERS.contains(token)) {
+                versionMarkers.add(token);
+            }
+            if (!TITLE_NOISE.contains(token)) {
+                normalizedTokens.add(token);
+            }
+        }
+        return new TitleSignature(String.join(" ", normalizedTokens),
+                Set.copyOf(normalizedTokens), Set.copyOf(versionMarkers));
+    }
+
+    private static int editDistance(String left, String right) {
+        int[] previous = new int[right.length() + 1];
+        int[] current = new int[right.length() + 1];
+        for (int index = 0; index <= right.length(); index++) {
+            previous[index] = index;
+        }
+        for (int leftIndex = 1; leftIndex <= left.length(); leftIndex++) {
+            current[0] = leftIndex;
+            for (int rightIndex = 1; rightIndex <= right.length(); rightIndex++) {
+                int substitution = previous[rightIndex - 1]
+                        + (left.charAt(leftIndex - 1) == right.charAt(rightIndex - 1) ? 0 : 1);
+                current[rightIndex] = Math.min(Math.min(
+                        previous[rightIndex] + 1, current[rightIndex - 1] + 1), substitution);
+            }
+            int[] swap = previous;
+            previous = current;
+            current = swap;
+        }
+        return previous[right.length()];
+    }
+
+    private static String sha256(Path file) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (var input = Files.newInputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
     }
 
     private AudioFeatures analyze(Path source) throws IOException, InterruptedException {
@@ -424,7 +606,27 @@ public final class MusicVibeSorter {
     }
 
     public record SortResult(Path originalPath, Path sortedPath, String vibe,
-                             AudioFeatures features, String classifier) {
+                             Optional<AudioFeatures> features, String classifier,
+                             Optional<DuplicateMatch> duplicate) {
+        public SortResult {
+            originalPath = Objects.requireNonNull(originalPath).toAbsolutePath().normalize();
+            sortedPath = Objects.requireNonNull(sortedPath).toAbsolutePath().normalize();
+            Objects.requireNonNull(vibe);
+            features = Objects.requireNonNull(features);
+            Objects.requireNonNull(classifier);
+            duplicate = Objects.requireNonNull(duplicate);
+        }
+
+        public boolean isDuplicate() {
+            return duplicate.isPresent();
+        }
+    }
+
+    public record DuplicateMatch(Path existingTrack, String evidence) {
+        public DuplicateMatch {
+            existingTrack = Objects.requireNonNull(existingTrack).toAbsolutePath().normalize();
+            evidence = Objects.requireNonNull(evidence);
+        }
     }
 
     public record Topic(String name, List<String> hints) {
@@ -452,4 +654,10 @@ public final class MusicVibeSorter {
     }
 
     private enum Archetype { ENERGETIC, CHILL, DARK, BRIGHT, MELANCHOLIC, ATMOSPHERIC }
+
+    private enum TitleMatch { NONE, EXACT, SIMILAR }
+
+    private record TitleSignature(String normalized, Set<String> tokens,
+                                  Set<String> versionMarkers) {
+    }
 }

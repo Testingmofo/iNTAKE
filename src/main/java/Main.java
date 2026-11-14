@@ -1,6 +1,7 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import javafx.animation.Interpolator;
+import javafx.animation.PauseTransition;
 import javafx.animation.TranslateTransition;
 import javafx.application.Application;
 import javafx.application.Platform;
@@ -81,6 +82,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -136,10 +138,12 @@ public final class Main extends Application {
     private static volatile String CYAN = DEFAULT_ACCENT_COLOR;
     private static volatile String MAGENTA = DEFAULT_HIGHLIGHT_COLOR;
     private static final String TEXT = "#d7f9ff";
-    private static final int MAX_LOG_NODES = 5_000;
+    private static final int MAX_PENDING_LOG_MESSAGES = 2_000;
+    private static final int MAX_RENDERED_LOG_CHARACTERS = 300_000;
     private static final int MAX_HISTORY_ENTRIES = 2_000;
     private static final int DOWNLOAD_CONCURRENCY = 2;
-    private static final int LOG_FLUSH_BATCH_SIZE = 250;
+    private static final int LOG_FLUSH_BATCH_SIZE = 120;
+    private static final int LOG_FLUSH_INTERVAL_MILLIS = 40;
     private static final int EXTENSION_BRIDGE_PORT = 17_845;
     private static final int MAX_EXTENSION_REQUEST_BYTES = 16_384;
     private static final String EXTENSION_ID = "omgodbpfilkfdihjffinlknijmdpogbn";
@@ -188,8 +192,13 @@ public final class Main extends Application {
     private final Object failureFileLock = new Object();
     private final Object historyFileLock = new Object();
     private final Object settingsFileLock = new Object();
-    private final ConcurrentLinkedQueue<LogMessage> pendingLogs = new ConcurrentLinkedQueue<>();
+    private final BlockingQueue<LogMessage> pendingLogs =
+            new LinkedBlockingQueue<>(MAX_PENDING_LOG_MESSAGES);
+    private final ConcurrentLinkedQueue<LogMessage> pendingPriorityLogs =
+            new ConcurrentLinkedQueue<>();
     private final AtomicBoolean logFlushScheduled = new AtomicBoolean(false);
+    private final AtomicInteger droppedNormalLogMessages = new AtomicInteger();
+    private final ArrayDeque<Integer> renderedLogChunkSizes = new ArrayDeque<>();
     private final java.util.Set<Process> activeProcesses = ConcurrentHashMap.newKeySet();
     private final java.util.Set<DownloadItem> activeItems = ConcurrentHashMap.newKeySet();
 
@@ -212,6 +221,7 @@ public final class Main extends Application {
     private Stage settingsStage;
     private Stage updateStage;
     private TranslateTransition marqueeAnimation;
+    private PauseTransition logFlushDelay;
     private TableView<DownloadItem> downloadTable;
     private TextFlow logFlow;
     private ScrollPane logScrollPane;
@@ -287,6 +297,10 @@ public final class Main extends Application {
         if (marqueeAnimation != null) {
             marqueeAnimation.stop();
             marqueeAnimation = null;
+        }
+        if (logFlushDelay != null) {
+            logFlushDelay.stop();
+            logFlushDelay = null;
         }
         resumeWorkers();
         for (Process process : activeProcesses) {
@@ -1862,7 +1876,7 @@ public final class Main extends Application {
             for (int index = start; index < lines.size(); index++) {
                 try {
                     HistoryEntry entry = HistoryEntry.decode(lines.get(index));
-                    downloads.add(new DownloadItem(entry.name(), DownloadStatus.COMPLETED,
+                    downloads.add(new DownloadItem(entry.name(), entry.status(),
                             entry.fileSize(), entry.fileLocation()));
                 } catch (RuntimeException malformedEntry) {
                     System.err.println("Skipping malformed history entry " + (index + 1) + ": "
@@ -1875,9 +1889,14 @@ public final class Main extends Application {
     }
 
     private void markDownloadCompletedAndPersist(DownloadItem item) {
+        markDownloadCompletedAndPersist(item, DownloadStatus.COMPLETED);
+    }
+
+    private void markDownloadCompletedAndPersist(DownloadItem item, DownloadStatus finalStatus) {
+        item.updateCompletionSnapshots(finalStatus);
         runOnFx(() -> {
             item.setProgress("100%");
-            item.setStatus(DownloadStatus.COMPLETED);
+            item.setStatus(finalStatus);
         });
         try {
             HistoryEntry entry = HistoryEntry.from(item);
@@ -2183,12 +2202,21 @@ public final class Main extends Application {
             mvssWorker.execute(() -> {
                 try {
                     MusicVibeSorter.SortResult result = null;
+                    int duplicateCount = 0;
                     for (Path downloadedFile : completedFiles) {
                         result = musicVibeSorter.sort(downloadedFile, settings.audioOutputDirectory(),
                                 settings.mvssTopics());
-                        appendLog("MVSS // " + result.vibe().toUpperCase(Locale.ROOT) + " // "
-                                + result.sortedPath().getFileName() + " // " + result.classifier()
-                                + " // " + result.features().summary(), LogKind.SUCCESS);
+                        if (result.isDuplicate()) {
+                            duplicateCount++;
+                            MusicVibeSorter.DuplicateMatch match = result.duplicate().orElseThrow();
+                            appendLog("MVSS // DUPLICATE // " + result.sortedPath().getFileName()
+                                    + " // " + match.evidence() + " // existing: "
+                                    + match.existingTrack(), LogKind.WARNING);
+                        } else {
+                            appendLog("MVSS // " + result.vibe().toUpperCase(Locale.ROOT) + " // "
+                                    + result.sortedPath().getFileName() + " // " + result.classifier()
+                                    + " // " + result.features().orElseThrow().summary(), LogKind.SUCCESS);
+                        }
                     }
                     if (result == null) {
                         throw new IOException("MVSS received no completed audio files");
@@ -2200,9 +2228,19 @@ public final class Main extends Application {
                         item.setName(finalResult.sortedPath().getFileName().toString());
                         item.setFileLocation(finalResult.sortedPath().toString());
                     });
-                    markDownloadCompletedAndPersist(item);
-                    appendLog("Completed and sorted " + completedFiles.size() + " audio file(s).",
-                            LogKind.SUCCESS);
+                    DownloadStatus finalStatus = duplicateCount == completedFiles.size()
+                            ? DownloadStatus.DUPLICATE : DownloadStatus.COMPLETED;
+                    markDownloadCompletedAndPersist(item, finalStatus);
+                    if (duplicateCount > 0) {
+                        appendLog("MVSS quarantined " + duplicateCount + " duplicate audio file(s) in "
+                                + settings.audioOutputDirectory().resolve("MVSS").resolve("Duplicates")
+                                + ".", LogKind.WARNING);
+                    }
+                    if (duplicateCount < completedFiles.size()) {
+                        appendLog("Completed and sorted "
+                                + (completedFiles.size() - duplicateCount) + " audio file(s).",
+                                LogKind.SUCCESS);
+                    }
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     markDownloadCompletedAndPersist(item);
@@ -2323,13 +2361,7 @@ public final class Main extends Application {
             String size = progress.group("size");
             String percent = progress.group("percent") + "%";
             item.updateTransferSnapshots(size, percent);
-            runOnFx(() -> {
-                item.setFileSize(size);
-                item.setProgress(percent);
-                if (!paused.get()) {
-                    item.setStatus(DownloadStatus.DOWNLOADING);
-                }
-            });
+            scheduleTransferUiRefresh(item);
             return;
         }
 
@@ -2341,10 +2373,44 @@ public final class Main extends Application {
             Path path = Path.of(stripSurroundingQuotes(pathText)).toAbsolutePath().normalize();
             String detectedName = path.getFileName() == null ? path.toString() : path.getFileName().toString();
             item.updateFileIdentitySnapshots(detectedName, path.toString());
-            runOnFx(() -> {
-                item.setName(detectedName);
-                item.setFileLocation(path.toString());
-            });
+            scheduleIdentityUiRefresh(item);
+        });
+    }
+
+    private void scheduleTransferUiRefresh(DownloadItem item) {
+        if (!item.markTransferUiRefreshScheduled()) {
+            return;
+        }
+        runOnFx(() -> {
+            String size = item.getFileSizeSnapshot();
+            String progress = item.getProgressSnapshot();
+            item.setFileSize(size);
+            item.setProgress(progress);
+            if (!paused.get()) {
+                item.setStatus(DownloadStatus.DOWNLOADING);
+            }
+            item.clearTransferUiRefreshScheduled();
+            if (!size.equals(item.getFileSizeSnapshot())
+                    || !progress.equals(item.getProgressSnapshot())) {
+                scheduleTransferUiRefresh(item);
+            }
+        });
+    }
+
+    private void scheduleIdentityUiRefresh(DownloadItem item) {
+        if (!item.markIdentityUiRefreshScheduled()) {
+            return;
+        }
+        runOnFx(() -> {
+            String name = item.getNameSnapshot();
+            String location = item.getFileLocationSnapshot();
+            item.setName(name);
+            item.setFileLocation(location);
+            item.clearIdentityUiRefreshScheduled();
+            if (!name.equals(item.getNameSnapshot())
+                    || !location.equals(item.getFileLocationSnapshot())) {
+                scheduleIdentityUiRefresh(item);
+            }
         });
     }
 
@@ -2508,47 +2574,103 @@ public final class Main extends Application {
     }
 
     private void appendLog(String message, LogKind kind) {
-        pendingLogs.add(new LogMessage(Instant.now(), message, kind));
+        LogMessage entry = new LogMessage(Instant.now(), message, kind);
+        if (kind != LogKind.NORMAL) {
+            pendingPriorityLogs.add(entry);
+        } else if (!pendingLogs.offer(entry)) {
+            droppedNormalLogMessages.incrementAndGet();
+        }
         scheduleLogFlush();
     }
 
     private void scheduleLogFlush() {
         if (logFlushScheduled.compareAndSet(false, true)) {
-            runOnFx(this::flushPendingLogs);
+            runOnFx(() -> {
+                logFlushDelay = new PauseTransition(
+                        Duration.millis(LOG_FLUSH_INTERVAL_MILLIS));
+                logFlushDelay.setOnFinished(event -> {
+                    logFlushDelay = null;
+                    flushPendingLogs();
+                });
+                logFlushDelay.play();
+            });
         }
     }
 
     private void flushPendingLogs() {
         if (logFlow == null) {
             pendingLogs.clear();
+            pendingPriorityLogs.clear();
+            droppedNormalLogMessages.set(0);
             logFlushScheduled.set(false);
             return;
         }
-        int appended = 0;
-        LogMessage entry;
-        while (appended < LOG_FLUSH_BATCH_SIZE && (entry = pendingLogs.poll()) != null) {
-            Text timestamp = new Text("[" + LOG_TIME.format(entry.timestamp()) + "] ");
-            timestamp.setFill(Color.web("#718096"));
-            timestamp.setFont(Font.font("Monospaced", 12));
 
-            Text content = new Text(entry.message() + System.lineSeparator());
-            content.setFill(entry.kind().color());
-            content.setFont(Font.font("Monospaced",
-                    entry.kind().bold() ? FontWeight.BOLD : FontWeight.NORMAL, 12));
-            logFlow.getChildren().addAll(timestamp, content);
-            appended++;
+        List<LogMessage> batch = new ArrayList<>(LOG_FLUSH_BATCH_SIZE + 1);
+        int dropped = droppedNormalLogMessages.getAndSet(0);
+        if (dropped > 0) {
+            batch.add(new LogMessage(Instant.now(), "LOG THROTTLE // Skipped " + dropped
+                    + " high-frequency output line(s); download processing continued normally.",
+                    LogKind.WARNING));
         }
-        int overflow = logFlow.getChildren().size() - MAX_LOG_NODES;
-        if (overflow > 0) {
-            logFlow.getChildren().remove(0, Math.min(overflow, logFlow.getChildren().size()));
+        while (batch.size() < LOG_FLUSH_BATCH_SIZE) {
+            LogMessage normal = pendingLogs.peek();
+            LogMessage priority = pendingPriorityLogs.peek();
+            if (normal == null && priority == null) {
+                break;
+            }
+            if (priority != null && (normal == null
+                    || !priority.timestamp().isAfter(normal.timestamp()))) {
+                batch.add(pendingPriorityLogs.poll());
+            } else {
+                batch.add(pendingLogs.poll());
+            }
         }
-        if (appended > 0) {
-            logScrollPane.layout();
+
+        boolean autoScroll = logFlow.getChildren().isEmpty()
+                || logScrollPane.getVvalue() >= 0.98;
+        LogKind chunkKind = null;
+        StringBuilder chunk = new StringBuilder();
+        for (LogMessage message : batch) {
+            if (chunkKind != null && chunkKind != message.kind()) {
+                appendRenderedLogChunk(chunk.toString(), chunkKind);
+                chunk.setLength(0);
+            }
+            chunkKind = message.kind();
+            chunk.append('[').append(LOG_TIME.format(message.timestamp())).append("] ")
+                    .append(message.message()).append(System.lineSeparator());
+        }
+        if (chunkKind != null && !chunk.isEmpty()) {
+            appendRenderedLogChunk(chunk.toString(), chunkKind);
+        }
+        trimRenderedLogChunks();
+        if (!batch.isEmpty() && autoScroll) {
             logScrollPane.setVvalue(1.0);
         }
+
         logFlushScheduled.set(false);
-        if (!pendingLogs.isEmpty()) {
+        if (!pendingLogs.isEmpty() || !pendingPriorityLogs.isEmpty()
+                || droppedNormalLogMessages.get() > 0) {
             scheduleLogFlush();
+        }
+    }
+
+    private void appendRenderedLogChunk(String content, LogKind kind) {
+        Text text = new Text(content);
+        text.setFill(kind.color());
+        text.setFont(Font.font("Monospaced",
+                kind.bold() ? FontWeight.BOLD : FontWeight.NORMAL, 12));
+        logFlow.getChildren().add(text);
+        renderedLogChunkSizes.addLast(content.length());
+    }
+
+    private void trimRenderedLogChunks() {
+        int renderedCharacters = renderedLogChunkSizes.stream()
+                .mapToInt(Integer::intValue).sum();
+        while (renderedCharacters > MAX_RENDERED_LOG_CHARACTERS
+                && renderedLogChunkSizes.size() > 1 && !logFlow.getChildren().isEmpty()) {
+            renderedCharacters -= renderedLogChunkSizes.removeFirst();
+            logFlow.getChildren().remove(0);
         }
     }
 
@@ -3135,6 +3257,7 @@ public final class Main extends Application {
         DOWNLOADING("Downloading"),
         PAUSED("Paused"),
         COMPLETED("Completed"),
+        DUPLICATE("Duplicate"),
         ERROR("Error");
 
         private final String label;
@@ -3161,6 +3284,8 @@ public final class Main extends Application {
         private volatile String fileSizeSnapshot;
         private volatile String fileLocationSnapshot;
         private volatile String errorSnapshot = "";
+        private final AtomicBoolean transferUiRefreshScheduled = new AtomicBoolean(false);
+        private final AtomicBoolean identityUiRefreshScheduled = new AtomicBoolean(false);
 
         public DownloadItem(String name, DownloadStatus status, String fileSize, String fileLocation) {
             this.name = new SimpleStringProperty(this, "name", Objects.requireNonNull(name));
@@ -3224,6 +3349,27 @@ public final class Main extends Application {
         public void updateFileIdentitySnapshots(String fileName, String location) {
             nameSnapshot = Objects.requireNonNull(fileName);
             fileLocationSnapshot = Objects.requireNonNull(location);
+        }
+
+        public void updateCompletionSnapshots(DownloadStatus completionStatus) {
+            statusSnapshot = Objects.requireNonNull(completionStatus);
+            progressSnapshot = "100%";
+        }
+
+        public boolean markTransferUiRefreshScheduled() {
+            return transferUiRefreshScheduled.compareAndSet(false, true);
+        }
+
+        public void clearTransferUiRefreshScheduled() {
+            transferUiRefreshScheduled.set(false);
+        }
+
+        public boolean markIdentityUiRefreshScheduled() {
+            return identityUiRefreshScheduled.compareAndSet(false, true);
+        }
+
+        public void clearIdentityUiRefreshScheduled() {
+            identityUiRefreshScheduled.set(false);
         }
     }
 
@@ -3355,7 +3501,8 @@ public final class Main extends Application {
         }
     }
 
-    private record HistoryEntry(Instant completedAt, String name, String fileSize, String fileLocation) {
+    private record HistoryEntry(Instant completedAt, String name, String fileSize,
+                                String fileLocation, DownloadStatus status) {
         private static final Base64.Encoder ENCODER = Base64.getUrlEncoder().withoutPadding();
         private static final Base64.Decoder DECODER = Base64.getUrlDecoder();
 
@@ -3364,25 +3511,27 @@ public final class Main extends Application {
             Objects.requireNonNull(name);
             Objects.requireNonNull(fileSize);
             Objects.requireNonNull(fileLocation);
+            Objects.requireNonNull(status);
         }
 
         private static HistoryEntry from(DownloadItem item) {
             return new HistoryEntry(Instant.now(), item.getNameSnapshot(), item.getFileSizeSnapshot(),
-                    item.getFileLocationSnapshot());
+                    item.getFileLocationSnapshot(), item.getStatusSnapshot());
         }
 
         private String encode() {
             return completedAt + "\t" + encodeField(name) + "\t" + encodeField(fileSize)
-                    + "\t" + encodeField(fileLocation);
+                    + "\t" + encodeField(fileLocation) + "\t" + status.name();
         }
 
         private static HistoryEntry decode(String line) {
             String[] fields = line.split("\\t", -1);
-            if (fields.length != 4) {
-                throw new IllegalArgumentException("Expected four tab-separated fields");
+            if (fields.length != 4 && fields.length != 5) {
+                throw new IllegalArgumentException("Expected four or five tab-separated fields");
             }
             return new HistoryEntry(Instant.parse(fields[0]), decodeField(fields[1]),
-                    decodeField(fields[2]), decodeField(fields[3]));
+                    decodeField(fields[2]), decodeField(fields[3]), fields.length == 5
+                    ? DownloadStatus.valueOf(fields[4]) : DownloadStatus.COMPLETED);
         }
 
         private static String encodeField(String value) {
@@ -3510,6 +3659,7 @@ public final class Main extends Application {
                         ? Color.web(YELLOW)
                         : value.startsWith(DownloadStatus.ERROR.toString())
                                 || value.startsWith(DownloadStatus.PAUSED.toString())
+                                || value.startsWith(DownloadStatus.DUPLICATE.toString())
                                 ? Color.web(MAGENTA) : Color.web(CYAN));
             }
             setFont(Font.font("Monospaced", FontWeight.BOLD, 12));

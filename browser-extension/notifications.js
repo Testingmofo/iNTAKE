@@ -77,6 +77,14 @@
         }, 7000);
         return;
       }
+      if (job.status === "duplicate") {
+        show({
+          state: "active",
+          title: `${title} // DUPLICATE QUARANTINED`,
+          message: "MVSS moved the duplicate into its Duplicates folder."
+        }, 8000);
+        return;
+      }
       if (job.status === "error") {
         show({
           state: "error",

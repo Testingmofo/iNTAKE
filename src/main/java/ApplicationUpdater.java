@@ -64,7 +64,7 @@ public final class ApplicationUpdater {
         if (packaged != null && packaged.matches("\\d+\\.\\d+\\.\\d+")) {
             return packaged + "-beta";
         }
-        return "0.2.2-beta";
+        return "0.2.3-beta";
     }
 
     public Optional<ReleaseInfo> findNewerBetaRelease() throws IOException, InterruptedException {

@@ -6,13 +6,14 @@
 
     <groupId>com.insrt</groupId>
     <artifactId>intake</artifactId>
-    <version>0.2.2-beta</version>
+    <version>0.2.3-beta</version>
     <name>iNTAKE</name>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>17</maven.compiler.release>
         <javafx.version>21.0.8</javafx.version>
+        <junit.version>5.11.4</junit.version>
     </properties>
 
     <dependencies>
@@ -20,6 +21,12 @@
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-controls</artifactId>
             <version>${javafx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 
