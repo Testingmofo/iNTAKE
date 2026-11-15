@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.function.Supplier;
 
 /**
  * MVSS (Music Vibes Storage Sorter) classifies an audio file locally and moves
@@ -68,9 +69,16 @@ public final class MusicVibeSorter {
 
     private final String ffmpegExecutable;
     private final HttpClient httpClient;
+    private final Supplier<Optional<String>> preferredModel;
 
     public MusicVibeSorter(String ffmpegExecutable) {
+        this(ffmpegExecutable, Optional::empty);
+    }
+
+    public MusicVibeSorter(String ffmpegExecutable,
+                           Supplier<Optional<String>> preferredModel) {
         this.ffmpegExecutable = Objects.requireNonNull(ffmpegExecutable);
+        this.preferredModel = Objects.requireNonNull(preferredModel);
         httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(650))
                 .build();
@@ -462,7 +470,7 @@ public final class MusicVibeSorter {
             if (tags.statusCode() / 100 != 2) {
                 return Optional.empty();
             }
-            Optional<String> model = selectSmallModel(tags.body());
+            Optional<String> model = selectSmallModel(tags.body(), preferredModel.get());
             if (model.isEmpty()) {
                 return Optional.empty();
             }
@@ -507,14 +515,31 @@ public final class MusicVibeSorter {
         }
     }
 
-    private static Optional<String> selectSmallModel(String tagsJson) {
+    private static Optional<String> selectSmallModel(String tagsJson,
+                                                      Optional<String> preferredModel) {
         List<String> models = new ArrayList<>();
         Matcher matcher = MODEL_NAME.matcher(tagsJson);
         while (matcher.find()) {
             String name = matcher.group(1);
             String lower = name.toLowerCase(Locale.ROOT);
-            if (containsAny(lower, "0.5b", "1b", "1.5b", "2b", "3b", "mini")) {
+            if (containsAny(lower, "270m", "360m", "0.5b", "0.6b", "0.8b", "1b",
+                    "1.5b", "1.7b", "2b", "3b", "mini")) {
                 models.add(name);
+            }
+        }
+        if (preferredModel != null && preferredModel.isPresent()) {
+            Optional<String> selected = models.stream()
+                    .filter(model -> model.equalsIgnoreCase(preferredModel.get())).findFirst();
+            if (selected.isPresent()) {
+                return selected;
+            }
+        }
+        for (String preferred : List.of("qwen3:0.6b", "qwen3.5:0.8b", "gemma3:1b",
+                "gemma3:270m", "qwen:0.5b", "smollm2:360m")) {
+            Optional<String> match = models.stream()
+                    .filter(model -> model.equalsIgnoreCase(preferred)).findFirst();
+            if (match.isPresent()) {
+                return match;
             }
         }
         return models.stream().min(Comparator.comparingInt(String::length));

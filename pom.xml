@@ -6,7 +6,7 @@
 
     <groupId>com.insrt</groupId>
     <artifactId>intake</artifactId>
-    <version>0.2.3-beta</version>
+    <version>0.2.4-beta</version>
     <name>iNTAKE</name>
 
     <properties>

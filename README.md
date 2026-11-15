@@ -84,6 +84,8 @@ For example, `Boss Music | boss, battle, intense, game` creates an `MVSS\Boss Mu
 
 The acoustic classifier works fully offline by combining measured audio features with configured topic hints. If Ollama is already running with a small local model (up to roughly 3B parameters), MVSS asks it to choose only from the configured topic list as an optional refinement step. Ollama is not required.
 
+The configuration matrix includes an **MVSS AI Enhancement // Ollama** manager. It detects an installed executable, the running local API, version, model storage, installed models, CPU architecture, logical processor count, and free model-drive space. If Ollama is missing, iNTAKE can download its latest official Windows installer, verify it using the release's `sha256sum.txt`, and open the official setup as an optional add-on. A compatible-model menu recommends `qwen3:0.6b` while offering smaller and stronger alternatives, displays storage and hardware warnings, streams model-pull progress, and provides buttons for opening the Ollama installation and model directories.
+
 Before acoustic classification, MVSS checks the existing audio library for duplicates. Byte-identical tracks are verified with SHA-256, while renamed or differently encoded copies use conservative normalized-title matching. Meaningful version markers—including live, remix, acoustic, instrumental, slowed, cover, and remastered—remain distinct. A detected copy is given the **Duplicate** table status and moved safely to `<Audio download location>\MVSS\Duplicates`; it is not permanently deleted. The log records the evidence and the existing track it matched.
 
 ## Cyberpunk theme customization

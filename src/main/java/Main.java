@@ -208,7 +208,9 @@ public final class Main extends Application {
             daemonThreadFactory("intake-background"));
     private final ExecutorService mvssWorker = Executors.newSingleThreadExecutor(
             daemonThreadFactory("intake-mvss"));
-    private final MusicVibeSorter musicVibeSorter = new MusicVibeSorter(resolveFfmpegExecutable());
+    private final OllamaManager ollamaManager = new OllamaManager(APPLICATION_DATA_DIRECTORY);
+    private final MusicVibeSorter musicVibeSorter = new MusicVibeSorter(
+            resolveFfmpegExecutable(), ollamaManager::preferredModel);
     private final ApplicationUpdater applicationUpdater = new ApplicationUpdater(
             APPLICATION_DATA_DIRECTORY);
 
@@ -220,6 +222,7 @@ public final class Main extends Application {
     private Stage primaryStage;
     private Stage settingsStage;
     private Stage updateStage;
+    private Stage ollamaStage;
     private TranslateTransition marqueeAnimation;
     private PauseTransition logFlushDelay;
     private TableView<DownloadItem> downloadTable;
@@ -234,6 +237,7 @@ public final class Main extends Application {
     private final Path historyFile = APPLICATION_DATA_DIRECTORY.resolve("download-history.tsv");
     private volatile AppSettings appSettings = AppSettings.defaults();
     private volatile ApplicationUpdater.ExtensionSyncResult extensionSyncResult;
+    private volatile OllamaManager.Status ollamaStatus;
     private double windowDragOffsetX;
     private double windowDragOffsetY;
     private boolean windowDragArmed;
@@ -678,6 +682,7 @@ public final class Main extends Application {
         TextField videoPath = createSettingsPathField(appSettings.videoOutputDirectory());
         ThemeEditor themeEditor = createThemeEditor(appSettings.theme());
         TextArea mvssTopics = createMvssTopicEditor(appSettings.mvssTopics());
+        VBox aiEnhancement = createAiEnhancementSection();
 
         VBox editor = new VBox(12,
                 settingsSectionLabel("FORMAT ROUTING", CYAN),
@@ -685,6 +690,7 @@ public final class Main extends Application {
                 favoritesRow,
                 youtubeAccessBox,
                 themeEditor.root(),
+                aiEnhancement,
                 settingsSectionLabel("MVSS AUDIO THEMES // TOPICS", CYAN),
                 mvssTopics,
                 mvssTopicHelp(),
@@ -740,6 +746,266 @@ public final class Main extends Application {
         });
         wireSettingsWindowDragging(settingsRoot, settingsStage);
         settingsStage.show();
+    }
+
+    private VBox createAiEnhancementSection() {
+        Label status = new Label("SCANNING // Detecting Ollama installation and local API...");
+        status.setWrapText(true);
+        status.setTextFill(Color.web(CYAN));
+        status.setFont(Font.font("Monospaced", FontWeight.BOLD, 11));
+
+        Label models = new Label("LOCAL MODELS // scanning");
+        models.setWrapText(true);
+        models.setTextFill(Color.web("#8ca3b8"));
+        models.setFont(Font.font("Monospaced", 10));
+
+        Button manage = new Button("MANAGE AI ADD-ON");
+        manage.setStyle(primaryButtonStyle());
+        manage.setOnAction(event -> showOllamaAddonManager());
+        Button openLocation = new Button("OPEN OLLAMA LOCATION");
+        openLocation.setStyle(primaryButtonStyle());
+        openLocation.setDisable(true);
+        openLocation.setOnAction(event -> {
+            OllamaManager.Status detected = ollamaStatus;
+            if (detected != null) {
+                detected.executable().map(Path::getParent).ifPresent(this::openDirectory);
+            }
+        });
+        Button refresh = new Button("RESCAN");
+        refresh.setStyle(warningButtonStyle());
+        refresh.setOnAction(event -> refreshOllamaStatus(status, models, openLocation));
+        HBox actions = new HBox(9, manage, openLocation, refresh);
+        actions.setAlignment(Pos.CENTER_LEFT);
+
+        Label warning = new Label(
+                "OPTIONAL // Ollama is not bundled with iNTAKE. Local inference requires Windows "
+                        + "10 22H2+, about 4 GB for Ollama, additional model storage, and preferably "
+                        + "8 GB or more system RAM. CPU-only systems work but classify more slowly.");
+        warning.setWrapText(true);
+        warning.setTextFill(Color.web(MAGENTA));
+        warning.setFont(Font.font("Monospaced", 10));
+
+        Separator separator = new Separator();
+        separator.setStyle("-fx-background-color: " + CYAN + ";");
+        VBox section = new VBox(8, separator,
+                settingsSectionLabel("MVSS AI ENHANCEMENT // OLLAMA", CYAN),
+                status, models, actions, warning);
+        section.setPadding(new Insets(7, 0, 5, 0));
+        refreshOllamaStatus(status, models, openLocation);
+        return section;
+    }
+
+    private void refreshOllamaStatus(Label statusLabel, Label modelsLabel, Button openLocation) {
+        statusLabel.setText("SCANNING // Detecting Ollama installation and local API...");
+        statusLabel.setTextFill(Color.web(CYAN));
+        openLocation.setDisable(true);
+        background.execute(() -> {
+            OllamaManager.Status detected = ollamaManager.detect();
+            ollamaStatus = detected;
+            runOnFx(() -> {
+                if (detected.running()) {
+                    statusLabel.setText("ONLINE // Ollama " + detected.version()
+                            + " is responding at 127.0.0.1:11434");
+                    statusLabel.setTextFill(Color.web(YELLOW));
+                } else if (detected.installed()) {
+                    statusLabel.setText("INSTALLED // Ollama was found but its local API is offline");
+                    statusLabel.setTextFill(Color.web(CYAN));
+                } else {
+                    statusLabel.setText("NOT INSTALLED // Optional AI enhancement is unavailable");
+                    statusLabel.setTextFill(Color.web(MAGENTA));
+                }
+                modelsLabel.setText("LOCAL MODELS // " + (detected.models().isEmpty()
+                        ? "none detected" : String.join(", ", detected.models()))
+                        + ollamaManager.preferredModel()
+                                .map(model -> System.lineSeparator()
+                                        + "MVSS PREFERRED // " + model).orElse("")
+                        + System.lineSeparator() + "HARDWARE // " + detected.hardwareSummary());
+                openLocation.setDisable(detected.executable().isEmpty());
+            });
+        });
+    }
+
+    private void showOllamaAddonManager() {
+        if (ollamaStage != null) {
+            ollamaStage.toFront();
+            return;
+        }
+        ComboBox<OllamaManager.ModelOption> modelSelector = new ComboBox<>(
+                FXCollections.observableArrayList(ollamaManager.compatibleModels()));
+        modelSelector.setValue(ollamaManager.compatibleModels().stream()
+                .filter(OllamaManager.ModelOption::recommended).findFirst()
+                .orElse(ollamaManager.compatibleModels().get(0)));
+        modelSelector.setMaxWidth(Double.MAX_VALUE);
+        modelSelector.setStyle("-fx-background-color: #080a0f; -fx-border-color: " + CYAN
+                + "; -fx-border-width: 1; -fx-background-radius: 0; -fx-font-family: 'Monospaced';");
+
+        Label description = new Label();
+        description.setWrapText(true);
+        description.setTextFill(Color.web(TEXT));
+        description.setFont(Font.font("Monospaced", 10));
+        Runnable refreshDescription = () -> {
+            OllamaManager.ModelOption selected = modelSelector.getValue();
+            description.setText(selected == null ? "" : selected.description()
+                    + System.lineSeparator() + "MODEL DOWNLOAD // " + selected.downloadSize());
+        };
+        modelSelector.setOnAction(event -> refreshDescription.run());
+        refreshDescription.run();
+
+        Label state = new Label("SCANNING // Ollama state");
+        state.setWrapText(true);
+        state.setTextFill(Color.web(CYAN));
+        state.setFont(Font.font("Monospaced", FontWeight.BOLD, 11));
+        Label progress = new Label("Select a compatible small model. Availability is validated by Ollama when pulled.");
+        progress.setWrapText(true);
+        progress.setTextFill(Color.web("#8ca3b8"));
+        progress.setFont(Font.font("Monospaced", 10));
+
+        Button installEngine = new Button("INSTALL OLLAMA ADD-ON");
+        installEngine.setStyle(primaryButtonStyle());
+        Button installModel = new Button("INSTALL SELECTED MODEL");
+        installModel.setStyle(primaryButtonStyle());
+        Button openLocation = new Button("OPEN OLLAMA LOCATION");
+        openLocation.setStyle(primaryButtonStyle());
+        Button openModels = new Button("OPEN MODEL LOCATION");
+        openModels.setStyle(primaryButtonStyle());
+        Button officialLibrary = new Button("OFFICIAL MODEL LIBRARY");
+        officialLibrary.setStyle(warningButtonStyle());
+
+        Runnable refresh = () -> background.execute(() -> {
+            OllamaManager.Status detected = ollamaManager.detect();
+            ollamaStatus = detected;
+            runOnFx(() -> {
+                state.setText(detected.running()
+                        ? "ONLINE // Ollama " + detected.version() + " // models: "
+                                + (detected.models().isEmpty() ? "none" : String.join(", ", detected.models()))
+                                + ollamaManager.preferredModel()
+                                        .map(model -> " // MVSS preferred: " + model).orElse("")
+                        : detected.installed()
+                                ? "INSTALLED // Local API offline; model installation will start it"
+                                : "NOT INSTALLED // Install the verified official add-on first");
+                state.setTextFill(Color.web(detected.running() ? YELLOW
+                        : detected.installed() ? CYAN : MAGENTA));
+                progress.setText("HARDWARE // " + detected.hardwareSummary()
+                        + System.lineSeparator() + "MODEL STORAGE // " + detected.modelDirectory());
+                installEngine.setDisable(detected.installed());
+                installModel.setDisable(!detected.installed());
+                openLocation.setDisable(detected.executable().isEmpty());
+                openModels.setDisable(!Files.isDirectory(detected.modelDirectory()));
+            });
+        });
+
+        installEngine.setOnAction(event -> {
+            installEngine.setDisable(true);
+            installModel.setDisable(true);
+            progress.setText("DOWNLOAD WARNING // The official Windows installer can exceed 1 GB. "
+                    + "Downloading and verifying now...");
+            background.execute(() -> {
+                try {
+                    Path installer = ollamaManager.downloadVerifiedInstaller(message ->
+                            runOnFx(() -> progress.setText(message)));
+                    runOnFx(() -> progress.setText(
+                            "VERIFIED // Complete the official Ollama installer window."));
+                    Process process = ollamaManager.launchInstaller(installer);
+                    process.waitFor();
+                    runOnFx(refresh);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    runOnFx(() -> progress.setText("Ollama installation was interrupted."));
+                } catch (IOException failure) {
+                    runOnFx(() -> {
+                        progress.setText("INSTALL FAILED // " + failure.getMessage());
+                        progress.setTextFill(Color.web(MAGENTA));
+                        installEngine.setDisable(false);
+                    });
+                }
+            });
+        });
+        installModel.setOnAction(event -> {
+            OllamaManager.ModelOption selected = modelSelector.getValue();
+            if (selected == null) return;
+            installModel.setDisable(true);
+            modelSelector.setDisable(true);
+            background.execute(() -> {
+                try {
+                    ollamaManager.pullModel(selected, message ->
+                            runOnFx(() -> progress.setText("MODEL PULL // " + message)));
+                    runOnFx(() -> {
+                        progress.setText("READY // " + selected.name()
+                                + " is installed for MVSS AI enhancement.");
+                        progress.setTextFill(Color.web(YELLOW));
+                        modelSelector.setDisable(false);
+                        refresh.run();
+                    });
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    runOnFx(() -> progress.setText("Model installation was interrupted."));
+                } catch (IOException failure) {
+                    runOnFx(() -> {
+                        progress.setText("MODEL INSTALL FAILED // " + failure.getMessage());
+                        progress.setTextFill(Color.web(MAGENTA));
+                        installModel.setDisable(false);
+                        modelSelector.setDisable(false);
+                    });
+                }
+            });
+        });
+        openLocation.setOnAction(event -> Optional.ofNullable(ollamaStatus)
+                .flatMap(OllamaManager.Status::executable).map(Path::getParent)
+                .ifPresent(this::openDirectory));
+        openModels.setOnAction(event -> Optional.ofNullable(ollamaStatus)
+                .map(OllamaManager.Status::modelDirectory).ifPresent(this::openDirectory));
+        officialLibrary.setOnAction(event -> openExternalUri(URI.create("https://ollama.com/library")));
+
+        HBox engineActions = new HBox(8, installEngine, installModel);
+        HBox locationActions = new HBox(8, openLocation, openModels, officialLibrary);
+        engineActions.setAlignment(Pos.CENTER_LEFT);
+        locationActions.setAlignment(Pos.CENTER_LEFT);
+        Label warning = new Label(
+                "MINIMUM WARNING // Windows 10 22H2+; 8 GB RAM recommended; approximately 4 GB "
+                        + "for Ollama plus the selected model. GPU acceleration depends on supported "
+                        + "drivers. CPU fallback is supported but slower.");
+        warning.setWrapText(true);
+        warning.setTextFill(Color.web(MAGENTA));
+        warning.setFont(Font.font("Monospaced", 10));
+        VBox content = new VBox(12,
+                settingsSectionLabel("// MVSS AI ENHANCEMENT MANAGER", CYAN),
+                state,
+                settingsSectionLabel("COMPATIBLE SMALL MODELS", YELLOW),
+                modelSelector, description, warning, engineActions, locationActions, progress);
+        content.setPadding(new Insets(18));
+        content.setStyle("-fx-background-color: " + PANEL + "; -fx-border-color: "
+                + CYAN + "; -fx-border-width: 1; -fx-font-family: 'Monospaced';");
+
+        Button close = new Button("CLOSE");
+        close.setStyle(warningButtonStyle());
+        close.setOnAction(event -> ollamaStage.close());
+        content.getChildren().add(close);
+        ollamaStage = new Stage(StageStyle.TRANSPARENT);
+        ollamaStage.initOwner(settingsStage != null ? settingsStage : primaryStage);
+        ollamaStage.initModality(Modality.WINDOW_MODAL);
+        ollamaStage.setTitle("iNTAKE // MVSS AI Enhancement");
+        ollamaStage.setScene(new Scene(content, 740, 510, Color.TRANSPARENT));
+        ollamaStage.setOnHidden(event -> ollamaStage = null);
+        ollamaStage.show();
+        refresh.run();
+    }
+
+    private void openDirectory(Path directory) {
+        try {
+            Files.createDirectories(directory);
+            Desktop.getDesktop().open(directory.toFile());
+        } catch (IOException | RuntimeException failure) {
+            appendLog("Unable to open directory " + directory + ": " + failure.getMessage(),
+                    LogKind.ERROR);
+        }
+    }
+
+    private void openExternalUri(URI uri) {
+        try {
+            Desktop.getDesktop().browse(uri);
+        } catch (IOException | RuntimeException failure) {
+            appendLog("Unable to open " + uri + ": " + failure.getMessage(), LogKind.ERROR);
+        }
     }
 
     private HBox createSettingsTitleBar() {
