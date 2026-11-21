@@ -1,9 +1,9 @@
-iNTAKE 0.2.4 Beta
+iNTAKE 0.2.6 Cyberdeck
 ==================
 
 Recommended installation
 ------------------------
-Run iNTAKE-Setup-0.2.4-beta.exe. The installer contains a private Java runtime,
+Run iNTAKE-Setup-0.2.6-cyberdeck.exe. The installer contains a private Java runtime,
 JavaFX, yt-dlp, FFmpeg, Deno, and the browser wake helper. Maven, Chocolatey,
 and a system Java installation are not required.
 
@@ -22,7 +22,7 @@ Installed apps. The removal wizard leaves downloaded media and the user data in
 
 Portable edition
 ----------------
-Extract iNTAKE-Portable-0.2.4-beta.zip to a writable folder and run iNTAKE.exe.
+Extract iNTAKE-Portable-0.2.6-cyberdeck.zip to a writable folder and run iNTAKE.exe.
 Do not run it directly from inside the ZIP. Start it once before using the
 browser extension so the native wake path can be registered.
 

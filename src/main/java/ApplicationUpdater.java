@@ -64,7 +64,7 @@ public final class ApplicationUpdater {
         if (packaged != null && packaged.matches("\\d+\\.\\d+\\.\\d+")) {
             return packaged + "-beta";
         }
-        return "0.2.4-beta";
+        return "0.2.6-cyberdeck";
     }
 
     public Optional<ReleaseInfo> findNewerBetaRelease() throws IOException, InterruptedException {
@@ -137,6 +137,8 @@ public final class ApplicationUpdater {
                 "-Installer", staged.installer().toString(),
                 "-ExpectedHash", staged.expectedSha256(),
                 "-InstallDir", installation.toString(),
+                "-DataRoot", applicationDataDirectory.toString(),
+                "-TargetVersion", staged.release().version(),
                 "-ParentPid", Long.toString(parentPid))
                 .directory(script.getParent().toFile())
                 .start();
@@ -303,21 +305,155 @@ public final class ApplicationUpdater {
         }
     }
 
-    private static String updaterScript() {
+    static String updaterScript() {
         return """
                 param(
                     [Parameter(Mandatory=$true)][string]$Installer,
                     [Parameter(Mandatory=$true)][string]$ExpectedHash,
                     [Parameter(Mandatory=$true)][string]$InstallDir,
+                    [Parameter(Mandatory=$true)][string]$DataRoot,
+                    [Parameter(Mandatory=$true)][string]$TargetVersion,
                     [Parameter(Mandatory=$true)][long]$ParentPid
                 )
                 $ErrorActionPreference = 'Stop'
-                $log = Join-Path (Split-Path -Parent $Installer) 'update.log'
+                $temporaryRoot = Join-Path $env:TEMP ('iNTAKE-update-' + [guid]::NewGuid().ToString('N'))
+                [void](New-Item -ItemType Directory -Path $temporaryRoot -Force)
+                $temporaryInstaller = Join-Path $temporaryRoot 'iNTAKE-Setup.exe'
+                $temporaryLog = Join-Path $temporaryRoot 'update.log'
+
+                function Write-UpdateLog([string]$Message) {
+                    "[$(Get-Date -Format o)] $Message" | Add-Content -LiteralPath $temporaryLog
+                }
+
+                function Convert-iNTAKEVersion([string]$Value) {
+                    $match = [regex]::Match($Value, '(\\d+)\\.(\\d+)\\.(\\d+)(?:[^0-9]+(\\d+))?')
+                    if (-not $match.Success) { return [version]'0.0.0.0' }
+                    $revision = if ($match.Groups[4].Success) { [int]$match.Groups[4].Value } else { 0 }
+                    return [version]::new(
+                        [int]$match.Groups[1].Value,
+                        [int]$match.Groups[2].Value,
+                        [int]$match.Groups[3].Value,
+                        $revision)
+                }
+
+                $registryPaths = @(
+                    'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
+                    'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
+                    'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'
+                )
+
+                function Get-iNTAKEInstallations {
+                    @(Get-ItemProperty -Path $registryPaths -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -eq 'iNTAKE' -and $_.Publisher -eq 'iNSRT' } |
+                        ForEach-Object {
+                            $productMatch = [regex]::Match(
+                                ([string]$_.PSChildName + ' ' + [string]$_.UninstallString),
+                                '(?i)\\{[0-9a-f-]+\\}')
+                            [pscustomobject]@{
+                                Entry = $_
+                                Version = Convert-iNTAKEVersion ([string]$_.DisplayVersion)
+                                InstallLocation = [string]$_.InstallLocation
+                                ProductCode = if ($productMatch.Success) { $productMatch.Value } else { '' }
+                            }
+                        } | Sort-Object Version -Descending)
+                }
+
+                function Find-iNTAKEExecutable($Installation) {
+                    if ($null -eq $Installation -or [string]::IsNullOrWhiteSpace(
+                            $Installation.InstallLocation)) { return $null }
+                    $candidate = Join-Path $Installation.InstallLocation 'iNTAKE.exe'
+                    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+                    return $null
+                }
+
+                function Test-PathContains([string]$Parent, [string]$Child) {
+                    if ([string]::IsNullOrWhiteSpace($Parent) -or
+                            [string]::IsNullOrWhiteSpace($Child)) { return $false }
+                    $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd('\\')
+                    $childFull = [IO.Path]::GetFullPath($Child).TrimEnd('\\')
+                    return $childFull.Equals($parentFull, [StringComparison]::OrdinalIgnoreCase) -or
+                        $childFull.StartsWith(
+                            $parentFull + [IO.Path]::DirectorySeparatorChar,
+                            [StringComparison]::OrdinalIgnoreCase)
+                }
+
+                function Copy-LatestUserData {
+                    $targetRoot = Split-Path -Parent $InstallDir
+                    $targetData = Join-Path $targetRoot 'Data'
+                    [void](New-Item -ItemType Directory -Path $targetData -Force)
+                    $sources = @(Get-ChildItem -LiteralPath $DataRoot -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -like 'iNTAKEv*' -and $_.FullName -ne $targetRoot } |
+                        Sort-Object @{ Expression = { Convert-iNTAKEVersion $_.Name }; Descending = $true })
+                    $sourceData = $DataRoot
+                    if ($sources.Count -gt 0) {
+                        $sourceData = Join-Path $sources[0].FullName 'Data'
+                        if (-not (Test-Path -LiteralPath $sourceData -PathType Container)) {
+                            $sourceData = $sources[0].FullName
+                        }
+                    }
+                    foreach ($fileName in @('intake.properties', 'download-history.tsv')) {
+                        $source = Join-Path $sourceData $fileName
+                        $destination = Join-Path $targetData $fileName
+                        if ((Test-Path -LiteralPath $source -PathType Leaf) -and
+                                -not (Test-Path -LiteralPath $destination)) {
+                            Copy-Item -LiteralPath $source -Destination $destination
+                        }
+                    }
+                }
+
+                function Remove-SafeOlderInstallations($Winner) {
+                    foreach ($older in @(Get-iNTAKEInstallations | Where-Object {
+                            $_.Version -lt $Winner.Version })) {
+                        if ([string]::IsNullOrWhiteSpace($older.ProductCode)) {
+                            Write-UpdateLog "Retained older registration without a product code: $($older.Version)."
+                            continue
+                        }
+                        if (Test-PathContains $older.InstallLocation $Winner.InstallLocation) {
+                            Write-UpdateLog "Retained legacy $($older.Version) because its install directory contains the winning installation."
+                            continue
+                        }
+                        $remove = Start-Process -FilePath 'msiexec.exe' -ArgumentList @(
+                            '/x', $older.ProductCode, '/qn', '/norestart'
+                        ) -Wait -PassThru
+                        if ($remove.ExitCode -notin @(0, 1605, 1614, 3010)) {
+                            Write-UpdateLog "Older version $($older.Version) removal returned $($remove.ExitCode); the winning version was retained."
+                        } else {
+                            Write-UpdateLog "Removed older registered version $($older.Version)."
+                        }
+                    }
+                }
+
+                function Remove-UnregisteredOlderVersionDirectories($Winner) {
+                    $winnerRoot = Split-Path -Parent $Winner.InstallLocation
+                    $registrations = @(Get-iNTAKEInstallations)
+                    foreach ($directory in @(Get-ChildItem -LiteralPath $DataRoot -Directory `
+                            -ErrorAction SilentlyContinue | Where-Object {
+                                $_.Name -like 'iNTAKEv*' -and
+                                (Convert-iNTAKEVersion $_.Name) -lt $Winner.Version -and
+                                $_.FullName -ne $winnerRoot
+                            })) {
+                        $stillRegistered = @($registrations | Where-Object {
+                            Test-PathContains $directory.FullName $_.InstallLocation
+                        }).Count -gt 0
+                        if ($stillRegistered) {
+                            Write-UpdateLog "Retained registered version directory $($directory.FullName)."
+                            continue
+                        }
+                        Remove-Item -LiteralPath $directory.FullName -Recurse -Force
+                        Write-UpdateLog "Removed obsolete version directory $($directory.FullName)."
+                    }
+                }
+
                 try {
-                    "[$(Get-Date -Format o)] iNTAKE update started." | Set-Content -LiteralPath $log
+                    Write-UpdateLog "iNTAKE update to $TargetVersion started."
                     $actualHash = (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInvariant()
                     if ($actualHash -ne $ExpectedHash.ToLowerInvariant()) {
                         throw "Installer hash changed after verification."
+                    }
+                    Copy-Item -LiteralPath $Installer -Destination $temporaryInstaller
+                    $copiedHash = (Get-FileHash -LiteralPath $temporaryInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($copiedHash -ne $ExpectedHash.ToLowerInvariant()) {
+                        throw "Temporary installer hash verification failed."
                     }
                     $deadline = (Get-Date).AddSeconds(90)
                     while (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) {
@@ -331,49 +467,43 @@ public final class ApplicationUpdater {
                         Stop-Process -Force -ErrorAction SilentlyContinue
                     Start-Sleep -Milliseconds 750
 
-                    $registryPaths = @(
-                        'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
-                        'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
-                        'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'
-                    )
-                    $entry = Get-ItemProperty -Path $registryPaths -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -eq 'iNTAKE' -and $_.Publisher -eq 'iNSRT' } |
-                        Select-Object -First 1
-                    if ($entry) {
-                        $uninstall = [string]$entry.UninstallString
-                        if ($uninstall -notmatch '(?i)({[0-9a-f-]+})') {
-                            throw "The registered iNTAKE uninstaller has no MSI product code."
+                    $target = Convert-iNTAKEVersion $TargetVersion
+                    $winner = @(Get-iNTAKEInstallations | Where-Object {
+                        $_.Version -ge $target -and $null -ne (Find-iNTAKEExecutable $_)
+                    } | Select-Object -First 1)
+                    if ($winner.Count -eq 0) {
+                        [void](New-Item -ItemType Directory -Path (Split-Path -Parent $InstallDir) -Force)
+                        $installArgs = @('/quiet', ('INSTALLDIR="' + $InstallDir + '"'))
+                        $install = Start-Process -FilePath $temporaryInstaller `
+                            -ArgumentList $installArgs -Wait -PassThru
+                        if ($install.ExitCode -notin @(0, 1638, 1641, 3010)) {
+                            throw "Setup failed with exit code $($install.ExitCode)."
                         }
-                        $remove = Start-Process -FilePath 'msiexec.exe' -ArgumentList @(
-                            '/x', $Matches[1], '/qn', '/norestart'
-                        ) -Wait -PassThru
-                        if ($remove.ExitCode -notin @(0, 1605, 1614, 3010)) {
-                            throw "Uninstall failed with exit code $($remove.ExitCode)."
-                        }
+                        $winner = @(Get-iNTAKEInstallations | Where-Object {
+                            $_.Version -ge $target -and $null -ne (Find-iNTAKEExecutable $_)
+                        } | Select-Object -First 1)
+                    }
+                    if ($winner.Count -eq 0) {
+                        throw "Setup returned without a valid iNTAKE $TargetVersion installation."
                     }
 
-                    $installArgs = @('/quiet', ('INSTALLDIR="' + $InstallDir + '"'))
-                    $install = Start-Process -FilePath $Installer -ArgumentList $installArgs -Wait -PassThru
-                    if ($install.ExitCode -notin @(0, 1641, 3010)) {
-                        throw "Setup failed with exit code $($install.ExitCode)."
-                    }
-                    $installedEntry = Get-ItemProperty -Path $registryPaths -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -eq 'iNTAKE' -and $_.Publisher -eq 'iNSRT' } |
-                        Select-Object -First 1
-                    $actualInstallDir = if ($installedEntry -and $installedEntry.InstallLocation) {
-                        [string]$installedEntry.InstallLocation
-                    } else {
-                        $InstallDir
-                    }
-                    $application = Join-Path $actualInstallDir 'iNTAKE.exe'
-                    if (Test-Path -LiteralPath $application) {
-                        Start-Process -FilePath $application
-                    }
-                    "[$(Get-Date -Format o)] Update completed." | Add-Content -LiteralPath $log
+                    Copy-LatestUserData
+                    Remove-SafeOlderInstallations ($winner[0])
+                    Remove-UnregisteredOlderVersionDirectories ($winner[0])
+                    $application = Find-iNTAKEExecutable ($winner[0])
+                    Write-UpdateLog "Update completed. Winner: $($winner[0].Version) at $application."
+                    Start-Process -FilePath $application
                 } catch {
-                    "[$(Get-Date -Format o)] $($_ | Out-String)" | Add-Content -LiteralPath $log
-                    Start-Process -FilePath $Installer
-                    exit 1
+                    Write-UpdateLog ($_ | Out-String)
+                    if (Test-Path -LiteralPath $temporaryInstaller) {
+                        Start-Process -FilePath $temporaryInstaller
+                    }
+                } finally {
+                    try {
+                        [void](New-Item -ItemType Directory -Path $DataRoot -Force)
+                        Get-Content -LiteralPath $temporaryLog -ErrorAction SilentlyContinue |
+                            Add-Content -LiteralPath (Join-Path $DataRoot 'update-history.log')
+                    } catch { }
                 }
                 """;
     }

@@ -14,6 +14,7 @@ import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.scene.Cursor;
 import javafx.scene.Node;
 import javafx.scene.Parent;
 import javafx.scene.Scene;
@@ -33,6 +34,8 @@ import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.Tooltip;
 import javafx.scene.control.ToggleButton;
+import javafx.scene.input.MouseButton;
+import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
@@ -77,6 +80,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -144,10 +148,17 @@ public final class Main extends Application {
     private static final int DOWNLOAD_CONCURRENCY = 2;
     private static final int LOG_FLUSH_BATCH_SIZE = 120;
     private static final int LOG_FLUSH_INTERVAL_MILLIS = 40;
+    private static final double FRAME_CONTROL_WIDTH = 244.0;
+    private static final double FRAME_CONTROL_HEIGHT = 28.0;
+    private static final double FRAME_HEADER_Y = 28.0;
+    private static final double FRAME_BODY_Y = 50.0;
+    private static final double FRAME_BOTTOM_CUT = 24.0;
+    private static final double FRAME_RESIZE_MARGIN = 7.0;
     private static final int EXTENSION_BRIDGE_PORT = 17_845;
     private static final int MAX_EXTENSION_REQUEST_BYTES = 16_384;
     private static final String EXTENSION_ID = "omgodbpfilkfdihjffinlknijmdpogbn";
     private static final String NATIVE_HOST_NAME = "com.insrt.intake";
+    private static final Path APPLICATION_DATA_ROOT = resolveApplicationDataRoot();
     private static final Path APPLICATION_DATA_DIRECTORY = resolveApplicationDataDirectory();
     private static final List<String> SUPPORTED_AUDIO_FORMATS = List.of(
             "best", "aac", "alac", "flac", "m4a", "mp3", "opus", "vorbis", "wav");
@@ -208,11 +219,11 @@ public final class Main extends Application {
             daemonThreadFactory("intake-background"));
     private final ExecutorService mvssWorker = Executors.newSingleThreadExecutor(
             daemonThreadFactory("intake-mvss"));
-    private final OllamaManager ollamaManager = new OllamaManager(APPLICATION_DATA_DIRECTORY);
+    private final OllamaManager ollamaManager = new OllamaManager(APPLICATION_DATA_ROOT);
     private final MusicVibeSorter musicVibeSorter = new MusicVibeSorter(
             resolveFfmpegExecutable(), ollamaManager::preferredModel);
     private final ApplicationUpdater applicationUpdater = new ApplicationUpdater(
-            APPLICATION_DATA_DIRECTORY);
+            APPLICATION_DATA_ROOT);
 
     private volatile boolean silentLaunch;
     private volatile boolean extensionLaunch;
@@ -241,6 +252,13 @@ public final class Main extends Application {
     private double windowDragOffsetX;
     private double windowDragOffsetY;
     private boolean windowDragArmed;
+    private ResizeMode windowResizeMode = ResizeMode.NONE;
+    private double resizeStartScreenX;
+    private double resizeStartScreenY;
+    private double resizeStartStageX;
+    private double resizeStartStageY;
+    private double resizeStartWidth;
+    private double resizeStartHeight;
 
     public static void main(String[] args) {
         launch(args);
@@ -377,24 +395,51 @@ public final class Main extends Application {
 
         BorderPane applicationBody = new BorderPane(workspace);
         applicationBody.setTop(createApplicationHeader(stage));
-        applicationBody.setStyle("-fx-background-color: " + BACKGROUND + "; -fx-border-color: "
-                + YELLOW + "; -fx-border-width: 1;");
+        applicationBody.setStyle("-fx-background-color: " + BACKGROUND + ";");
 
-        StackPane windowFrame = new StackPane(applicationBody, createWindowControlPanel(stage));
-        StackPane.setMargin(applicationBody, new Insets(43, 0, 0, 0));
+        Polygon outline = new Polygon();
+        outline.setFill(Color.web(YELLOW));
+        outline.setMouseTransparent(true);
+
+        Polygon innerSurface = new Polygon();
+        innerSurface.setFill(Color.web(BACKGROUND));
+        innerSurface.setSmooth(false);
+        innerSurface.setMouseTransparent(true);
+
+        Polygon contentClip = new Polygon();
+        contentClip.setSmooth(false);
+
+        StackPane contentLayer = new StackPane(applicationBody, createWindowControlPanel(stage));
+        contentLayer.setStyle("-fx-background-color: transparent;");
+        contentLayer.setClip(contentClip);
+        StackPane.setMargin(applicationBody, new Insets(29, 1, 1, 1));
         StackPane.setAlignment(applicationBody, Pos.BOTTOM_CENTER);
+
+        StackPane windowFrame = new StackPane(outline, innerSurface, contentLayer);
         windowFrame.setStyle("-fx-background-color: transparent; -fx-font-family: 'Monospaced';");
+        windowFrame.setPickOnBounds(false);
+
+        Runnable updateSilhouette = () -> updateWindowSilhouette(
+                outline, innerSurface, contentClip,
+                windowFrame.getWidth(), windowFrame.getHeight());
+        windowFrame.widthProperty().addListener((property, oldValue, newValue) -> updateSilhouette.run());
+        windowFrame.heightProperty().addListener((property, oldValue, newValue) -> updateSilhouette.run());
 
         Scene scene = new Scene(windowFrame, 1280, 784, Color.TRANSPARENT);
+        scene.setFill(Color.TRANSPARENT);
         stage.setScene(scene);
         stage.setTitle("iNTAKE // Media NetCrawler");
         stage.setMinWidth(920);
         stage.setMinHeight(560);
+        installWindowResizeEngine(stage, scene);
         stage.setOnCloseRequest(event -> {
             event.consume();
             hideApplicationWindow("Window close requested");
         });
-        stage.setOnShown(event -> Platform.runLater(this::styleInterfaceSkins));
+        stage.setOnShown(event -> Platform.runLater(() -> {
+            updateSilhouette.run();
+            styleInterfaceSkins();
+        }));
     }
 
     private StackPane createApplicationHeader(Stage stage) {
@@ -423,7 +468,7 @@ public final class Main extends Application {
 
         HBox headerContent = new HBox(14, brand, marqueeViewport);
         headerContent.setAlignment(Pos.CENTER_LEFT);
-        headerContent.setPadding(new Insets(8, 275, 8, 16));
+        headerContent.setPadding(new Insets(8, 16, 8, 16));
         headerContent.setMaxWidth(Double.MAX_VALUE);
 
         StackPane header = new StackPane(headerContent);
@@ -433,13 +478,21 @@ public final class Main extends Application {
                 marqueeViewport, marqueeTrack, marqueeMessage, marqueeFont);
         marqueeViewport.widthProperty().addListener((property, oldValue, newValue) -> restartMarquee.run());
         Platform.runLater(restartMarquee);
-        header.setOnMousePressed(event -> {
+        wireWindowDragging(header, stage);
+        return header;
+    }
+
+    private void wireWindowDragging(Node dragSurface, Stage stage) {
+        dragSurface.setOnMousePressed(event -> {
+            if (event.getButton() != MouseButton.PRIMARY || windowResizeMode != ResizeMode.NONE) {
+                return;
+            }
             windowDragArmed = true;
             windowDragOffsetX = event.getScreenX() - stage.getX();
             windowDragOffsetY = event.getScreenY() - stage.getY();
         });
-        header.setOnMouseDragged(event -> {
-            if (!windowDragArmed) {
+        dragSurface.setOnMouseDragged(event -> {
+            if (!windowDragArmed || event.getButton() != MouseButton.PRIMARY) {
                 return;
             }
             if (stage.isMaximized()) {
@@ -451,8 +504,13 @@ public final class Main extends Application {
             stage.setX(event.getScreenX() - windowDragOffsetX);
             stage.setY(event.getScreenY() - windowDragOffsetY);
         });
-        header.setOnMouseReleased(event -> windowDragArmed = false);
-        return header;
+        dragSurface.setOnMouseReleased(event -> windowDragArmed = false);
+        dragSurface.setOnMouseClicked(event -> {
+            if (event.getButton() == MouseButton.PRIMARY && event.getClickCount() == 2) {
+                windowDragArmed = false;
+                stage.setMaximized(!stage.isMaximized());
+            }
+        });
     }
 
     private void restartMarquee(Pane viewport, HBox track, String message, Font font) {
@@ -513,38 +571,202 @@ public final class Main extends Application {
         closeButton.setAccessibleText("Close iNTAKE");
         closeButton.setOnAction(event -> hideApplicationWindow("Window Close selected"));
 
-        HBox controls = new HBox(0, settingsButton, minimizeButton, maximizeButton, closeButton);
+        Label tabIdentity = new Label("// iNTAKE");
+        tabIdentity.setTextFill(Color.web(YELLOW));
+        tabIdentity.setFont(Font.font("Monospaced", FontWeight.BOLD, 9));
+        tabIdentity.setPadding(new Insets(0, 0, 0, 10));
+        tabIdentity.setAlignment(Pos.CENTER_LEFT);
+        tabIdentity.setMinWidth(100);
+        tabIdentity.setPrefWidth(100);
+        tabIdentity.setMaxWidth(100);
+        wireWindowDragging(tabIdentity, stage);
+
+        HBox controls = new HBox(0, tabIdentity, settingsButton, minimizeButton, maximizeButton,
+                closeButton);
         controls.setAlignment(Pos.CENTER);
+        controls.setStyle("-fx-background-color: #080a0f; -fx-border-color: transparent transparent "
+                + CYAN + " transparent; -fx-border-width: 0 0 1 0;");
 
-        Polygon enclosure = createControlPanelPolygon();
-        enclosure.setFill(Color.web(BACKGROUND));
-        enclosure.setMouseTransparent(true);
-
-        Polyline exteriorEdges = new Polyline(
-                0.0, 43.0,
-                60.0, 2.0,
-                204.0, 2.0,
-                264.0, 43.0);
-        exteriorEdges.setFill(Color.TRANSPARENT);
-        exteriorEdges.setStroke(Color.web(YELLOW));
-        exteriorEdges.setStrokeWidth(1.0);
-        exteriorEdges.setStrokeLineJoin(StrokeLineJoin.MITER);
-        exteriorEdges.setSmooth(false);
-        exteriorEdges.setMouseTransparent(true);
-
-        Pane panelGeometry = new Pane(enclosure, exteriorEdges);
-        panelGeometry.setMinSize(264, 43);
-        panelGeometry.setPrefSize(264, 43);
-        panelGeometry.setMaxSize(264, 43);
-        panelGeometry.setMouseTransparent(true);
-
-        StackPane panel = new StackPane(panelGeometry, controls);
-        panel.setMinSize(264, 43);
-        panel.setPrefSize(264, 43);
-        panel.setMaxSize(264, 43);
-        panel.setPickOnBounds(false);
+        StackPane panel = new StackPane(controls);
+        panel.setMinSize(FRAME_CONTROL_WIDTH, FRAME_CONTROL_HEIGHT);
+        panel.setPrefSize(FRAME_CONTROL_WIDTH, FRAME_CONTROL_HEIGHT);
+        panel.setMaxSize(FRAME_CONTROL_WIDTH, FRAME_CONTROL_HEIGHT);
+        StackPane.setMargin(panel, new Insets(1, 28, 0, 0));
         StackPane.setAlignment(panel, Pos.TOP_RIGHT);
         return panel;
+    }
+
+    private static void updateWindowSilhouette(
+            Polygon outline, Polygon innerSurface, Polygon contentClip,
+            double width, double height) {
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+        outline.getPoints().setAll(silhouettePoints(width, height, 0));
+        List<Double> innerPoints = silhouettePoints(width, height, 1);
+        innerSurface.getPoints().setAll(innerPoints);
+        contentClip.getPoints().setAll(innerPoints);
+    }
+
+    static List<Double> silhouettePoints(double width, double height, double inset) {
+        double left = inset;
+        double right = Math.max(left, width - inset);
+        double top = inset;
+        double bottom = Math.max(top, height - inset);
+        return List.of(
+                left, FRAME_BODY_Y,
+                22.0 + inset, FRAME_HEADER_Y + inset,
+                width - 300.0, FRAME_HEADER_Y + inset,
+                width - 272.0, top,
+                width - 28.0, top,
+                right, FRAME_HEADER_Y + inset,
+                right, height - FRAME_BOTTOM_CUT,
+                width - FRAME_BOTTOM_CUT, bottom,
+                FRAME_BOTTOM_CUT, bottom,
+                left, height - FRAME_BOTTOM_CUT);
+    }
+
+    private void installWindowResizeEngine(Stage stage, Scene scene) {
+        scene.addEventFilter(MouseEvent.MOUSE_MOVED, event -> {
+            if (windowResizeMode != ResizeMode.NONE || windowDragArmed) {
+                return;
+            }
+            ResizeMode mode = resizeModeAt(
+                    event.getSceneX(), event.getSceneY(), stage.getWidth(), stage.getHeight(),
+                    stage.isMaximized());
+            scene.setCursor(mode.cursor());
+        });
+        scene.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> {
+            if (event.getButton() != MouseButton.PRIMARY || stage.isMaximized()) {
+                return;
+            }
+            ResizeMode mode = resizeModeAt(
+                    event.getSceneX(), event.getSceneY(), stage.getWidth(), stage.getHeight(), false);
+            if (mode == ResizeMode.NONE) {
+                return;
+            }
+            windowDragArmed = false;
+            windowResizeMode = mode;
+            resizeStartScreenX = event.getScreenX();
+            resizeStartScreenY = event.getScreenY();
+            resizeStartStageX = stage.getX();
+            resizeStartStageY = stage.getY();
+            resizeStartWidth = stage.getWidth();
+            resizeStartHeight = stage.getHeight();
+            event.consume();
+        });
+        scene.addEventFilter(MouseEvent.MOUSE_DRAGGED, event -> {
+            if (windowResizeMode == ResizeMode.NONE || !event.isPrimaryButtonDown()) {
+                return;
+            }
+            resizeWindow(stage, event.getScreenX(), event.getScreenY());
+            event.consume();
+        });
+        scene.addEventFilter(MouseEvent.MOUSE_RELEASED, event -> {
+            if (windowResizeMode != ResizeMode.NONE) {
+                windowResizeMode = ResizeMode.NONE;
+                scene.setCursor(Cursor.DEFAULT);
+                event.consume();
+            }
+        });
+        scene.addEventFilter(MouseEvent.MOUSE_EXITED, event -> {
+            if (windowResizeMode == ResizeMode.NONE && !windowDragArmed) {
+                scene.setCursor(Cursor.DEFAULT);
+            }
+        });
+    }
+
+    static ResizeMode resizeModeAt(
+            double x, double y, double width, double height, boolean maximized) {
+        if (maximized || width <= 0 || height <= 0) {
+            return ResizeMode.NONE;
+        }
+        double margin = FRAME_RESIZE_MARGIN;
+        boolean nearLeft = x <= margin && y >= FRAME_BODY_Y - margin
+                && y <= height - FRAME_BOTTOM_CUT + margin;
+        boolean nearRight = x >= width - margin && y >= FRAME_HEADER_Y - margin
+                && y <= height - FRAME_BOTTOM_CUT + margin;
+        boolean nearTop = y <= margin && x >= width - 272.0 - margin
+                && x <= width - 28.0 + margin;
+        boolean nearBottom = y >= height - margin && x >= FRAME_BOTTOM_CUT - margin
+                && x <= width - FRAME_BOTTOM_CUT + margin;
+
+        boolean lowerLeftDiagonal = y >= height - FRAME_BOTTOM_CUT - margin
+                && x <= FRAME_BOTTOM_CUT + margin
+                && Math.abs(x - (y - (height - FRAME_BOTTOM_CUT))) <= margin;
+        boolean lowerRightDiagonal = y >= height - FRAME_BOTTOM_CUT - margin
+                && x >= width - FRAME_BOTTOM_CUT - margin
+                && Math.abs((width - x) - (y - (height - FRAME_BOTTOM_CUT))) <= margin;
+        boolean upperLeftDiagonal = y >= FRAME_HEADER_Y - margin && y <= FRAME_BODY_Y + margin
+                && x <= 22.0 + margin
+                && Math.abs(x - (FRAME_BODY_Y - y)) <= margin;
+        boolean upperRightDiagonal = y <= FRAME_HEADER_Y + margin
+                && x >= width - 28.0 - margin
+                && Math.abs((width - x) - (FRAME_HEADER_Y - y)) <= margin;
+
+        if (lowerLeftDiagonal || (nearLeft && nearBottom)) return ResizeMode.SOUTH_WEST;
+        if (lowerRightDiagonal || (nearRight && nearBottom)) return ResizeMode.SOUTH_EAST;
+        if (upperLeftDiagonal) return ResizeMode.NORTH_WEST;
+        if (upperRightDiagonal || (nearRight && nearTop)) return ResizeMode.NORTH_EAST;
+        if (nearLeft) return ResizeMode.WEST;
+        if (nearRight) return ResizeMode.EAST;
+        if (nearTop) return ResizeMode.NORTH;
+        if (nearBottom) return ResizeMode.SOUTH;
+        return ResizeMode.NONE;
+    }
+
+    private void resizeWindow(Stage stage, double screenX, double screenY) {
+        double deltaX = screenX - resizeStartScreenX;
+        double deltaY = screenY - resizeStartScreenY;
+        double minimumWidth = Math.max(stage.getMinWidth(), 1.0);
+        double minimumHeight = Math.max(stage.getMinHeight(), 1.0);
+
+        if (windowResizeMode.east()) {
+            stage.setWidth(Math.max(minimumWidth, resizeStartWidth + deltaX));
+        } else if (windowResizeMode.west()) {
+            double width = Math.max(minimumWidth, resizeStartWidth - deltaX);
+            stage.setX(resizeStartStageX + resizeStartWidth - width);
+            stage.setWidth(width);
+        }
+        if (windowResizeMode.south()) {
+            stage.setHeight(Math.max(minimumHeight, resizeStartHeight + deltaY));
+        } else if (windowResizeMode.north()) {
+            double height = Math.max(minimumHeight, resizeStartHeight - deltaY);
+            stage.setY(resizeStartStageY + resizeStartHeight - height);
+            stage.setHeight(height);
+        }
+    }
+
+    enum ResizeMode {
+        NONE(Cursor.DEFAULT, false, false, false, false),
+        NORTH(Cursor.N_RESIZE, false, false, true, false),
+        SOUTH(Cursor.S_RESIZE, false, false, false, true),
+        EAST(Cursor.E_RESIZE, false, true, false, false),
+        WEST(Cursor.W_RESIZE, true, false, false, false),
+        NORTH_EAST(Cursor.NE_RESIZE, false, true, true, false),
+        NORTH_WEST(Cursor.NW_RESIZE, true, false, true, false),
+        SOUTH_EAST(Cursor.SE_RESIZE, false, true, false, true),
+        SOUTH_WEST(Cursor.SW_RESIZE, true, false, false, true);
+
+        private final Cursor cursor;
+        private final boolean west;
+        private final boolean east;
+        private final boolean north;
+        private final boolean south;
+
+        ResizeMode(Cursor cursor, boolean west, boolean east, boolean north, boolean south) {
+            this.cursor = cursor;
+            this.west = west;
+            this.east = east;
+            this.north = north;
+            this.south = south;
+        }
+
+        Cursor cursor() { return cursor; }
+        boolean west() { return west; }
+        boolean east() { return east; }
+        boolean north() { return north; }
+        boolean south() { return south; }
     }
 
     private StackPane createMaximizeIcon(boolean restoreMode) {
@@ -1447,7 +1669,7 @@ public final class Main extends Application {
         return label;
     }
 
-    private static Path resolveApplicationDataDirectory() {
+    private static Path resolveApplicationDataRoot() {
         Path directory;
         if (isPackagedApplication()) {
             String localAppData = System.getenv("LOCALAPPDATA");
@@ -1463,6 +1685,82 @@ public final class Main extends Application {
             System.err.println("Unable to create iNTAKE data directory " + directory + ": " + failure);
         }
         return directory.toAbsolutePath().normalize();
+    }
+
+    private static Path resolveApplicationDataDirectory() {
+        if (!isPackagedApplication()) {
+            return APPLICATION_DATA_ROOT;
+        }
+        String version = ApplicationUpdater.currentVersion().replaceAll("[^0-9A-Za-z._-]", "_");
+        Path versionRoot = APPLICATION_DATA_ROOT.resolve("iNTAKEv" + version)
+                .toAbsolutePath().normalize();
+        Path versionDirectory = versionRoot.resolve("Data");
+        try {
+            Files.createDirectories(versionDirectory);
+            migrateLatestVersionData(versionRoot, versionDirectory);
+        } catch (IOException failure) {
+            System.err.println("Unable to prepare version data directory " + versionDirectory
+                    + ": " + failure);
+        }
+        return versionDirectory;
+    }
+
+    private static void migrateLatestVersionData(Path currentVersionRoot, Path destination)
+            throws IOException {
+        if (Files.isRegularFile(destination.resolve("intake.properties"))
+                || !Files.isDirectory(APPLICATION_DATA_ROOT)) {
+            return;
+        }
+        try (var entries = Files.list(APPLICATION_DATA_ROOT)) {
+            Optional<Path> previous = entries
+                    .filter(Files::isDirectory)
+                    .filter(path -> path.getFileName().toString().startsWith("iNTAKEv"))
+                    .filter(path -> !path.equals(currentVersionRoot))
+                    .max(Main::compareVersionDirectories);
+            Path previousData = previous
+                    .map(path -> Files.isDirectory(path.resolve("Data"))
+                            ? path.resolve("Data") : path)
+                    .orElse(APPLICATION_DATA_ROOT);
+            for (String fileName : List.of("intake.properties", "download-history.tsv")) {
+                Path source = previousData.resolve(fileName);
+                Path target = destination.resolve(fileName);
+                if (Files.isRegularFile(source) && !Files.exists(target)) {
+                    Files.copy(source, target, StandardCopyOption.COPY_ATTRIBUTES);
+                }
+            }
+        }
+    }
+
+    private static List<Integer> versionDirectoryKey(Path directory) {
+        String name = directory.getFileName().toString().replaceFirst("(?i)^iNTAKEv", "");
+        Matcher matcher = Pattern.compile("(\\d+)").matcher(name);
+        List<Integer> parts = new ArrayList<>();
+        while (matcher.find()) {
+            try {
+                parts.add(Integer.parseInt(matcher.group(1)));
+            } catch (NumberFormatException ignored) {
+                parts.add(0);
+            }
+        }
+        while (parts.size() < 4) {
+            parts.add(0);
+        }
+        return List.copyOf(parts);
+    }
+
+    private static int compareVersionDirectories(Path left, Path right) {
+        List<Integer> leftParts = versionDirectoryKey(left);
+        List<Integer> rightParts = versionDirectoryKey(right);
+        int count = Math.max(leftParts.size(), rightParts.size());
+        for (int index = 0; index < count; index++) {
+            int leftPart = index < leftParts.size() ? leftParts.get(index) : 0;
+            int rightPart = index < rightParts.size() ? rightParts.get(index) : 0;
+            int comparison = Integer.compare(leftPart, rightPart);
+            if (comparison != 0) {
+                return comparison;
+            }
+        }
+        return left.getFileName().toString().compareToIgnoreCase(right.getFileName().toString());
     }
 
     private static boolean isPackagedApplication() {
@@ -1547,7 +1845,7 @@ public final class Main extends Application {
         }
 
         try {
-            Path manifest = APPLICATION_DATA_DIRECTORY.resolve(NATIVE_HOST_NAME + ".json");
+            Path manifest = APPLICATION_DATA_ROOT.resolve(NATIVE_HOST_NAME + ".json");
             String manifestJson = "{\n"
                     + "  \"name\": \"" + NATIVE_HOST_NAME + "\",\n"
                     + "  \"description\": \"Starts iNTAKE and forwards browser downloads.\",\n"
@@ -2757,8 +3055,9 @@ public final class Main extends Application {
         try {
             ApplicationUpdater.StagedUpdate staged = applicationUpdater.downloadAndVerify(
                     release, message -> appendLog("APP UPDATE // " + message, LogKind.SYSTEM));
-            Path installDirectory = currentInstallDirectory()
-                    .orElseThrow(() -> new IOException("The current installation directory is unknown"));
+            Path installDirectory = APPLICATION_DATA_ROOT.resolve(
+                    "iNTAKEv" + release.version().replaceAll("[^0-9A-Za-z._-]", "_"))
+                    .resolve("App");
             applicationUpdater.launchDetachedUpdate(
                     staged, installDirectory, ProcessHandle.current().pid());
             runOnFx(() -> shutdownApplication(
@@ -2777,15 +3076,6 @@ public final class Main extends Application {
                 showMainWindow();
             });
         }
-    }
-
-    private static Optional<Path> currentInstallDirectory() {
-        String applicationPath = System.getProperty("jpackage.app-path");
-        if (applicationPath == null || applicationPath.isBlank()) {
-            return Optional.empty();
-        }
-        Path parent = Path.of(applicationPath).toAbsolutePath().normalize().getParent();
-        return Optional.ofNullable(parent);
     }
 
     private void runUpdateCheck() {

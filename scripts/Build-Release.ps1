@@ -10,8 +10,8 @@ $stagingDirectory = Join-Path $projectRoot '.release-build'
 $packageInput = Join-Path $stagingDirectory 'input'
 $imageDirectory = Join-Path $stagingDirectory 'image'
 $applicationImage = Join-Path $imageDirectory 'iNTAKE'
-$version = '0.2.4'
-$releaseLabel = '0.2.4-beta'
+$version = '0.2.6'
+$releaseLabel = '0.2.6-cyberdeck'
 $pomPath = Join-Path $projectRoot 'pom.xml'
 [xml]$pomDocument = Get-Content -LiteralPath $pomPath -Raw
 $mavenArtifactVersion = [string]$pomDocument.project.version
@@ -182,6 +182,7 @@ Invoke-Checked $jpackage @(
     '--vendor', 'iNSRT',
     '--description', 'iNTAKE Media NetCrawler',
     '--win-per-user-install',
+    '--install-dir', "iNTAKE\iNTAKEv$releaseLabel\App",
     '--win-dir-chooser',
     '--win-menu',
     '--win-menu-group', 'iNTAKE',

@@ -25,7 +25,7 @@ For source development, run `Launch iNTAKE.cmd` and load this repository's `brow
 
 ## Managed updates
 
-Extension version 1.3.3 or newer asks the local iNTAKE bridge for the managed extension version every 30 minutes and on browser startup. When an application update has replaced the files in `%LOCALAPPDATA%\iNTAKE\browser-extension`, the service worker reloads the extension so the new scripts take effect. If the currently loaded extension comes from a different folder, it displays the managed directory that must be loaded once. Version 1.3.4 also treats MVSS duplicate quarantine as a finished browser request instead of continuing to poll it as an active download.
+Extension version 1.3.3 or newer asks the local iNTAKE bridge for the managed extension version every 30 minutes and on browser startup. When an application update has replaced the files in `%LOCALAPPDATA%\iNTAKE\browser-extension`, the service worker reloads the extension so the new scripts take effect. If the currently loaded extension comes from a different folder, it displays the managed directory that must be loaded once. Version 1.3.4 also treats MVSS duplicate quarantine as a finished browser request instead of continuing to poll it as an active download. Version 1.3.5 forces thumbnail controls to render with a fully opaque dark backing so host-site button styles cannot make them faint.
 
 Chrome and Edge intentionally restrict silent self-hosted extension installation outside their stores and enterprise policy. Consequently, iNTAKE can update the contents of its managed unpacked directory, but it cannot perform the initial **Load unpacked** action on the user's behalf.
 
