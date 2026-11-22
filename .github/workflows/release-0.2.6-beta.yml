@@ -27,7 +27,11 @@ jobs:
 
       - name: Build portable package and installer
         shell: powershell
-        run: ./scripts/Build-Release.ps1
+        run: |
+          New-Item -ItemType Directory -Path 'C:\t' -Force | Out-Null
+          $env:TEMP = 'C:\t'
+          $env:TMP = 'C:\t'
+          ./scripts/Build-Release.ps1
 
       - name: Publish beta release and assets
         shell: powershell
