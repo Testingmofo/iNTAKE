@@ -2,10 +2,8 @@ name: Build iNTAKE 0.2.6 Beta
 
 on:
   push:
-    tags:
-      - v0.2.6-beta
-  release:
-    types: [published]
+    branches:
+      - release/v0.2.6-beta
 
 permissions:
   contents: write
@@ -40,45 +38,18 @@ jobs:
           if ($assets.Count -lt 6) {
             throw "Expected all six release files, found $($assets.Count)."
           }
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          $title = "iNTAKE v$($version -replace '-beta$', '') Beta"
-          $releaseApiPath = "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME"
-          $releaseJson = & gh api $releaseApiPath 2>$null
-          $lookupExitCode = $LASTEXITCODE
-          if ($lookupExitCode -eq 0) {
-            $releaseId = ($releaseJson | ConvertFrom-Json).id
-            $uploadArguments = @(
-              'release', 'upload', $env:GITHUB_REF_NAME,
-              '--repo', $env:GITHUB_REPOSITORY,
-              '--clobber'
-            ) + $assets
-            & gh @uploadArguments
-            if ($LASTEXITCODE -ne 0) {
-              throw "Uploading release assets failed with exit code $LASTEXITCODE."
-            }
-            $updateArguments = @(
-              'api', '--method', 'PATCH', "repos/$env:GITHUB_REPOSITORY/releases/$releaseId",
-              '-F', 'draft=false',
-              '-F', 'prerelease=true',
-              '-F', "name=$title",
-              '-F', 'body=@release/RELEASE-NOTES-v0.2.6-beta.md'
-            )
-            & gh @updateArguments
-            if ($LASTEXITCODE -ne 0) {
-              throw "Finalizing the GitHub release failed with exit code $LASTEXITCODE."
-            }
-          } else {
-            $createArguments = @(
-              'release', 'create', $env:GITHUB_REF_NAME,
-              '--repo', $env:GITHUB_REPOSITORY,
-              '--verify-tag',
-              '--prerelease',
-              '--title', $title,
-              '--notes-file', 'release/RELEASE-NOTES-v0.2.6-beta.md'
-            ) + $assets
-            & gh @createArguments
-            if ($LASTEXITCODE -ne 0) {
-              throw "GitHub release creation failed with exit code $LASTEXITCODE."
-            }
+          $tag = 'v0.2.6-beta'
+          $title = 'iNTAKE v0.2.6 Beta'
+          $arguments = @(
+            'release', 'create', $tag,
+            '--repo', $env:GITHUB_REPOSITORY,
+            '--target', $env:GITHUB_SHA,
+            '--prerelease',
+            '--title', $title,
+            '--notes-file', 'release/RELEASE-NOTES-v0.2.6-beta.md'
+          ) + $assets
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub release creation failed with exit code $LASTEXITCODE."
           }
 
