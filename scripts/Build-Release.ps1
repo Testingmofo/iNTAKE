@@ -12,6 +12,7 @@ $imageDirectory = Join-Path $stagingDirectory 'image'
 $applicationImage = Join-Path $imageDirectory 'iNTAKE'
 $version = '0.2.6'
 $releaseLabel = '0.2.6-beta'
+$wixResourceDirectory = Join-Path $stagingDirectory 'wix-resources'
 $pomPath = Join-Path $projectRoot 'pom.xml'
 [xml]$pomDocument = Get-Content -LiteralPath $pomPath -Raw
 $mavenArtifactVersion = [string]$pomDocument.project.version
@@ -104,6 +105,33 @@ function Invoke-Checked {
     }
 }
 
+function Get-JPackageFolderId {
+    param([Parameter(Mandatory)][string]$Path)
+    $identity = 'Folder@' + $Path.ToLowerInvariant()
+    $md5 = [Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))
+    } finally {
+        $md5.Dispose()
+    }
+    $bytes[6] = ($bytes[6] -band 0x0f) -bor 0x30
+    $bytes[8] = ($bytes[8] -band 0x3f) -bor 0x80
+    return 'dir' + ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+}
+
+function Get-DeterministicComponentGuid {
+    param([Parameter(Mandatory)][string]$Identity)
+    $md5 = [Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($Identity))
+    } finally {
+        $md5.Dispose()
+    }
+    $bytes[6] = ($bytes[6] -band 0x0f) -bor 0x30
+    $bytes[8] = ($bytes[8] -band 0x3f) -bor 0x80
+    return ([Guid]::new($bytes)).ToString('D')
+}
+
 Set-Location -LiteralPath $projectRoot
 Refresh-Environment
 
@@ -180,6 +208,23 @@ $portableArchive = Join-Path $releaseDirectory ("iNTAKE-Portable-$releaseLabel.z
 Compress-Archive -LiteralPath $applicationImage -DestinationPath $portableArchive -CompressionLevel Optimal
 
 Write-Host '[iNTAKE] Creating Windows Setup executable...' -ForegroundColor Cyan
+$profileRootPath = 'TARGETDIR\LocalAppDataFolder\iNTAKE'
+$profileVersionPath = $profileRootPath + '\iNTAKEv' + $releaseLabel
+$wixOverrides = Get-Content -LiteralPath (Join-Path $projectRoot 'release\windows\main.wxs') -Raw
+$wixOverrides = $wixOverrides.Replace('@PROFILE_ROOT_ID@', (Get-JPackageFolderId $profileRootPath))
+$wixOverrides = $wixOverrides.Replace('@PROFILE_VERSION_ID@', (Get-JPackageFolderId $profileVersionPath))
+$wixOverrides = $wixOverrides.Replace(
+    '@PROFILE_ROOT_GUID@', (Get-DeterministicComponentGuid ('iNTAKE cleanup root ' + $profileRootPath)))
+$wixOverrides = $wixOverrides.Replace(
+    '@PROFILE_VERSION_GUID@', (Get-DeterministicComponentGuid ('iNTAKE cleanup version ' + $profileVersionPath)))
+if ($wixOverrides -match '@PROFILE_[A-Z_]+@') {
+    throw 'A placeholder remains in the generated WiX resource override.'
+}
+[void](New-Item -ItemType Directory -Path $wixResourceDirectory -Force)
+[IO.File]::WriteAllText(
+    (Join-Path $wixResourceDirectory 'main.wxs'),
+    $wixOverrides,
+    [Text.UTF8Encoding]::new($false))
 Invoke-Checked $jpackage @(
     '--type', 'exe',
     '--dest', $releaseDirectory,
@@ -195,6 +240,7 @@ Invoke-Checked $jpackage @(
     '--win-menu-group', 'iNTAKE',
     '--win-shortcut',
     '--win-upgrade-uuid', $upgradeUuid,
+    '--resource-dir', $wixResourceDirectory,
     '--verbose'
 )
 
