@@ -6,7 +6,7 @@
 
     <groupId>com.insrt</groupId>
     <artifactId>intake</artifactId>
-    <version>0.2.6-cyberdeck</version>
+    <version>0.2.6-beta</version>
     <name>iNTAKE</name>
 
     <properties>
@@ -48,3 +48,4 @@
         </plugins>
     </build>
 </project>
+

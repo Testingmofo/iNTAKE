@@ -1,0 +1,84 @@
+name: Build iNTAKE 0.2.6 Beta
+
+on:
+  push:
+    tags:
+      - v0.2.6-beta
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install release packaging tools
+        shell: powershell
+        run: choco install maven wixtoolset deno yt-dlp ffmpeg --yes --no-progress
+
+      - name: Build portable package and installer
+        shell: powershell
+        run: ./scripts/Build-Release.ps1
+
+      - name: Publish beta release and assets
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem -LiteralPath 'For-Release' -File | Sort-Object Name | ForEach-Object FullName)
+          if ($assets.Count -lt 6) {
+            throw "Expected all six release files, found $($assets.Count)."
+          }
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $title = "iNTAKE v$($version -replace '-beta$', '') Beta"
+          $releaseApiPath = "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME"
+          $releaseJson = & gh api $releaseApiPath 2>$null
+          $lookupExitCode = $LASTEXITCODE
+          if ($lookupExitCode -eq 0) {
+            $releaseId = ($releaseJson | ConvertFrom-Json).id
+            $uploadArguments = @(
+              'release', 'upload', $env:GITHUB_REF_NAME,
+              '--repo', $env:GITHUB_REPOSITORY,
+              '--clobber'
+            ) + $assets
+            & gh @uploadArguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "Uploading release assets failed with exit code $LASTEXITCODE."
+            }
+            $updateArguments = @(
+              'api', '--method', 'PATCH', "repos/$env:GITHUB_REPOSITORY/releases/$releaseId",
+              '-F', 'draft=false',
+              '-F', 'prerelease=true',
+              '-F', "name=$title",
+              '-F', 'body=@release/RELEASE-NOTES-v0.2.6-beta.md'
+            )
+            & gh @updateArguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "Finalizing the GitHub release failed with exit code $LASTEXITCODE."
+            }
+          } else {
+            $createArguments = @(
+              'release', 'create', $env:GITHUB_REF_NAME,
+              '--repo', $env:GITHUB_REPOSITORY,
+              '--verify-tag',
+              '--prerelease',
+              '--title', $title,
+              '--notes-file', 'release/RELEASE-NOTES-v0.2.6-beta.md'
+            ) + $assets
+            & gh @createArguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "GitHub release creation failed with exit code $LASTEXITCODE."
+            }
+          }
+

@@ -64,7 +64,7 @@ public final class ApplicationUpdater {
         if (packaged != null && packaged.matches("\\d+\\.\\d+\\.\\d+")) {
             return packaged + "-beta";
         }
-        return "0.2.6-cyberdeck";
+        return "0.2.6-beta";
     }
 
     public Optional<ReleaseInfo> findNewerBetaRelease() throws IOException, InterruptedException {
@@ -573,3 +573,4 @@ public final class ApplicationUpdater {
         }
     }
 }
+

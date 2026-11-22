@@ -11,7 +11,7 @@ $packageInput = Join-Path $stagingDirectory 'input'
 $imageDirectory = Join-Path $stagingDirectory 'image'
 $applicationImage = Join-Path $imageDirectory 'iNTAKE'
 $version = '0.2.6'
-$releaseLabel = '0.2.6-cyberdeck'
+$releaseLabel = '0.2.6-beta'
 $pomPath = Join-Path $projectRoot 'pom.xml'
 [xml]$pomDocument = Get-Content -LiteralPath $pomPath -Raw
 $mavenArtifactVersion = [string]$pomDocument.project.version
@@ -48,6 +48,12 @@ function Refresh-Environment {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:Path = @($machinePath, $userPath) -join ';'
+    if ($env:JAVA_HOME) {
+        $javaBin = Join-Path $env:JAVA_HOME 'bin'
+        if (Test-Path -LiteralPath $javaBin) {
+            $env:Path = $javaBin + ';' + $env:Path
+        }
+    }
     $wixBin = 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
     if (Test-Path -LiteralPath $wixBin) {
         $env:Path = $wixBin + ';' + $env:Path
@@ -119,6 +125,7 @@ Write-Host '[iNTAKE] Compiling Java and resolving runtime dependencies...' -Fore
 Invoke-Checked $maven @(
     'clean', 'package', 'dependency:copy-dependencies',
     '-DincludeScope=runtime',
+    '-DskipTests',
     '-DoutputDirectory=target/release-dependencies'
 )
 
@@ -224,3 +231,4 @@ Remove-Item -LiteralPath $safeStagingDirectory -Recurse -Force
 
 Write-Host "[iNTAKE] Release completed: $releaseDirectory" -ForegroundColor Green
 Get-ChildItem -LiteralPath $releaseDirectory -File | Select-Object Name, Length
+
