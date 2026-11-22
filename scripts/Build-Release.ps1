@@ -194,7 +194,8 @@ Invoke-Checked $jpackage @(
     '--win-menu',
     '--win-menu-group', 'iNTAKE',
     '--win-shortcut',
-    '--win-upgrade-uuid', $upgradeUuid
+    '--win-upgrade-uuid', $upgradeUuid,
+    '--verbose'
 )
 
 $generatedInstaller = Get-ChildItem -LiteralPath $releaseDirectory -Filter '*.exe' -File |
